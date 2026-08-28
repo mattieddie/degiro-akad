@@ -256,6 +256,38 @@ def verify_series(
     return False
 
 
+def price_sanity_ok(
+    series_map: dict[str, float],
+    reference_price: float | None,
+    reference_date: str | None,
+    max_ratio: float = 3.0,
+    date_window_days: int = 2,
+) -> bool:
+    """
+    Lockere Plausibilitaetspruefung (Verhaeltnis statt exakter Toleranz):
+    verwirft nur grobe Fehler - falsches Instrument, falsche Waehrungseinheit
+    (z.B. GBX statt GBP), Chart-Decoding-Fehler - nicht kleine, normale
+    Abweichungen zwischen Datenanbietern (Dividenden-Anpassung, Handelsschluss-
+    Zeitpunkt). Der Kurs am (nahen) Referenzdatum darf hoechstens um den
+    Faktor max_ratio ueber oder unter DEGIROs gemeldetem Schlusskurs liegen.
+    """
+    if not series_map or not reference_price or reference_price <= 0 or not reference_date:
+        return False
+    try:
+        ref_day = date.fromisoformat(reference_date)
+    except ValueError:
+        return False
+    for offset in range(0, date_window_days + 1):
+        candidates = {ref_day} if offset == 0 else {ref_day - timedelta(days=offset), ref_day + timedelta(days=offset)}
+        for d in candidates:
+            got = series_map.get(d.isoformat())
+            if got is not None and got > 0:
+                ratio = got / reference_price
+                if (1 / max_ratio) <= ratio <= max_ratio:
+                    return True
+    return False
+
+
 # --- Hilfsfunktionen: historische Kurse, Fallback (Yahoo Finance) -----------
 # Wird nur verwendet, wenn DEGIROs eigenes Kurschart nicht abrufbar ist oder
 # sich nicht gegen den von DEGIRO gemeldeten Schlusskurs verifizieren laesst.
@@ -411,28 +443,31 @@ def resolve_price_series(
     3. Financial Modeling Prep (nur falls FMP_API_KEY gesetzt), falls auch Yahoo nichts liefert.
     4. Nichts gefunden.
 
-    "verified" ist nur noch eine Info-Kennzeichnung (Abgleich gegen DEGIROs
-    separat gemeldeten Schlusskurs) und entscheidet NICHT mehr, ob die Serie
-    verwendet wird - auf Wunsch, da eine leicht abweichende Schlusskurs-Meldung
-    zwischen Anbietern (Datum/Uhrzeit-Cutoff, Dividenden-Anpassung) haeufiger
-    vorkommt als ein tatsaechlich falsches Instrument. Schutz gegen grob falsch
-    skalierte Daten (z.B. falsches Instrument) bleibt ueber den
-    Tag-zu-Tag-Ausreisserfilter beim Aufbau der Wertkurve bestehen.
+    "verified" ist nur noch eine Info-Kennzeichnung (exakter Abgleich gegen
+    DEGIROs separat gemeldeten Schlusskurs) und entscheidet NICHT mehr allein,
+    ob die Serie verwendet wird - kleine, normale Abweichungen zwischen
+    Anbietern (Datum/Uhrzeit-Cutoff, Dividenden-Anpassung) sollen nicht mehr
+    zur Ablehnung fuehren. Als Gate dient stattdessen price_sanity_ok() mit
+    einem groben Faktor-3-Rahmen: das faengt weiterhin ein komplett falsches
+    Instrument oder eine falsche Waehrungseinheit ab (z.B. der Fall, der zu
+    einer ~6.5x ueberhoehten Portfolio-Rekonstruktion gefuehrt hat, als die
+    Verifizierung testweise ganz entfernt war), lehnt aber keine Serie mehr
+    wegen einer harmlosen kleinen Kursabweichung ab.
     """
     if vwd_id:
         degiro_series = fetch_daily_close_series(user_token, vwd_id, since_d)
-        if degiro_series:
+        if degiro_series and price_sanity_ok(degiro_series, close_price, close_price_date):
             verified = verify_series(degiro_series, close_price, close_price_date)
             return degiro_series, "degiro", verified, currency
 
     yahoo_series, yahoo_ccy = fetch_yahoo_daily_close_series(isin, symbol, since_d)
-    if yahoo_series:
+    if yahoo_series and price_sanity_ok(yahoo_series, close_price, close_price_date):
         verified = verify_series(yahoo_series, close_price, close_price_date, tolerance_pct=0.03)
         return yahoo_series, "yahoo", verified, (yahoo_ccy or currency)
 
     if get_fmp_api_key():
         fmp_series, fmp_ccy = fetch_fmp_daily_close_series(isin, since_d)
-        if fmp_series:
+        if fmp_series and price_sanity_ok(fmp_series, close_price, close_price_date):
             verified = verify_series(fmp_series, close_price, close_price_date, tolerance_pct=0.03)
             return fmp_series, "fmp", verified, (fmp_ccy or currency)
 

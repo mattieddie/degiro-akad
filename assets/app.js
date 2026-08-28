@@ -175,8 +175,8 @@ function computeRebasedPerformance(series) {
   return g.map((v) => (v === null ? null : ((1 + v) / base - 1) * 100));
 }
 
-function updatePerfBadge(pctSeries) {
-  const badge = el("chart-perf-badge");
+function updatePerfBadge(pctSeries, badgeId = "chart-perf-badge") {
+  const badge = el(badgeId);
   let last = null;
   for (let i = pctSeries.length - 1; i >= 0; i--) {
     if (pctSeries[i] !== null && pctSeries[i] !== undefined) { last = pctSeries[i]; break; }
@@ -412,10 +412,12 @@ function renderModalChart() {
   const ctx = el("modal-chart").getContext("2d");
   if (modalChart) modalChart.destroy();
 
+  const basePoint = series.find((s) => s.priceNative !== null && s.priceNative !== undefined && s.priceNative !== 0);
+  const base = basePoint ? basePoint.priceNative : null;
+  const pct = series.map((s) => (base && s.priceNative !== null && s.priceNative !== undefined ? ((s.priceNative / base) - 1) * 100 : null));
+  updatePerfBadge(pct, "modal-perf-badge");
+
   if (modalMode === "percent") {
-    const basePoint = series.find((s) => s.priceNative !== null && s.priceNative !== undefined && s.priceNative !== 0);
-    const base = basePoint ? basePoint.priceNative : null;
-    const pct = series.map((s) => (base && s.priceNative !== null && s.priceNative !== undefined ? ((s.priceNative / base) - 1) * 100 : null));
     modalChart = new Chart(ctx, {
       type: "line",
       data: { labels: series.map((s) => s.date), datasets: [{
@@ -476,7 +478,9 @@ async function openPositionModal(position) {
   el("modal-value").textContent = fmtChf(position.valueChf);
   el("modal-avg").textContent = fmtNative(position.averagePrice, position.currency);
   const plPctTxt = position.plUnrealizedPct !== null && position.plUnrealizedPct !== undefined ? ` (${position.plUnrealizedPct.toFixed(1)}%)` : "";
-  el("modal-pl").textContent = position.plUnrealizedChf !== null && position.plUnrealizedChf !== undefined ? fmtChf(position.plUnrealizedChf) + plPctTxt : "–";
+  const modalPlEl = el("modal-pl");
+  modalPlEl.textContent = position.plUnrealizedChf !== null && position.plUnrealizedChf !== undefined ? fmtChf(position.plUnrealizedChf) + plPctTxt : "–";
+  modalPlEl.className = "stat-value small " + (position.plUnrealizedChf > 0 ? "pl-pos" : position.plUnrealizedChf < 0 ? "pl-neg" : "");
   el("modal-verify-note").textContent = "Lade Kursverlauf...";
   setModalModeButtons();
   setModalRangeButtons();

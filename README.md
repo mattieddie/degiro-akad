@@ -129,23 +129,26 @@ Der Graph kombiniert zwei Quellen:
    berechnet beim Verbinden aus deiner kompletten Transaktionshistorie plus
    Kurscharts einen Best-Effort-Verlauf zurück bis zu deinem ersten Kauf.
    Quellen der Reihe nach: DEGIROs eigenes Kurschart → Yahoo Finance
-   (Symbol über ISIN aufgelöst) → Financial Modeling Prep (falls
-   `FMP_API_KEY` gesetzt). Die **erste Quelle, die überhaupt Daten liefert,
-   wird verwendet** – unabhängig davon, ob der Schlusskurs exakt mit dem von
-   DEGIRO separat gemeldeten übereinstimmt (kleine Abweichungen zwischen
-   Anbietern, z.B. durch Dividenden-Anpassung oder Handelsschluss-Zeitpunkt,
-   sind normal). Ob eine Serie exakt übereinstimmt, wird nur noch informativ
-   als `verified` mitgeliefert, entscheidet aber nicht mehr über die
-   Verwendung. Nur wenn **keine** der drei Quellen überhaupt Daten liefert,
+   (Symbol über ISIN aufgelöst) → Financial Modeling Prep (falls ein Key
+   hinterlegt ist). Eine Quelle muss den Kurs **nicht mehr exakt** treffen,
+   um verwendet zu werden – aber sie muss eine grobe Plausibilitätsprüfung
+   bestehen (`price_sanity_ok`): der Kurs am Referenzdatum darf höchstens um
+   den **Faktor 3** über oder unter dem von DEGIRO separat gemeldeten
+   Schlusskurs liegen. Das lässt normale Abweichungen zwischen Anbietern zu
+   (Dividenden-Anpassung, Handelsschluss-Zeitpunkt), verwirft aber weiterhin
+   ein komplett falsches Instrument oder eine falsche Währungseinheit (z.B.
+   GBX statt GBP) – genau der Fehler, der auftrat, als diese Prüfung
+   versuchsweise ganz entfernt war und die Rekonstruktion für einen Tag auf
+   das 6.5-fache des echten Werts sprang. Ob eine Serie zusätzlich *exakt*
+   übereinstimmt, wird nur noch informativ als `verified` mitgeliefert.
+   Erst wenn **keine** der drei Quellen die Plausibilitätsprüfung besteht,
    wird ein Näherungswert (letzter bekannter Kurs, flach) verwendet.
 
-   Schutz gegen grob falsch skalierte Daten (z.B. ein durch eine
-   fehlgeschlagene ISIN-Suche falsch getroffenes Instrument) bleibt trotzdem
-   bestehen, nur lockerer als eine exakte Kurs-Prüfung: ein einzelner Tag,
-   der um mehr als das 5-fache vom vorherigen bekannten Kurs abweicht, wird
-   beim Aufbau der Wertkurve verworfen (letzter guter Kurs bleibt stehen).
-   Zusätzlich wird die rekonstruierte Cash-Historie gegen den tatsächlichen,
-   live abgefragten Cash-Stand geprüft und bei starker Abweichung verworfen
+   Als weitere Absicherung: ein einzelner Tag, der um mehr als das 5-fache
+   vom vorherigen bekannten Kurs abweicht, wird beim Aufbau der Wertkurve
+   trotzdem verworfen (letzter guter Kurs bleibt stehen). Zusätzlich wird
+   die rekonstruierte Cash-Historie gegen den tatsächlichen, live
+   abgefragten Cash-Stand geprüft und bei starker Abweichung verworfen
    (flache Linie mit dem echten aktuellen Wert statt einer falschen Kurve).
 
    Die Seite zeigt dir unter dem Graphen und im Positions-Popup an, welche
