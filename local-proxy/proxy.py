@@ -575,12 +575,35 @@ def login():
         SESSION["trading_api"] = trading_api
         SESSION["int_account"] = int_account
         SESSION["user_token"] = user_token
-        SESSION["base_currency"] = detect_base_currency(client_details)
+        base_currency = detect_base_currency(client_details)
+        # client_details liefert bei diesem Konto weder "currency" noch
+        # "baseCurrency" (beide None) - detect_base_currency() faellt dann
+        # auf "EUR" zurueck, was aber nachweislich falsch ist: DEGIROs
+        # eigenes "value"-Feld je Position (siehe portfolio()) und die
+        # "...InBaseCurrency"-Felder der Transaktionen sind tatsaechlich
+        # bereits in der Waehrung angegeben, in der DEGIRO das Konto selbst
+        # fuehrt/anzeigt - verifizierbar direkt ueber die cashFunds-Waehrung
+        # (die "available to trade"-Anzeige ist nachweislich korrekt). Diese
+        # tatsaechliche Kontowaehrung hat Vorrang vor dem Rateversuch ueber
+        # client_details.
+        cash_currency = None
+        try:
+            cash_update = trading_api.get_update(
+                request_list=[UpdateRequest(option=UpdateOption.CASH_FUNDS, last_updated=0)],
+                raw=True,
+            )
+            _cash_amount, cash_currency = _get_cash_available_to_trade(cash_update)
+            if cash_currency:
+                base_currency = cash_currency
+        except Exception:  # noqa: BLE001
+            logger.warning("Konto-Waehrung ueber cashFunds nicht ermittelbar, verwende Fallback", exc_info=True)
+        SESSION["base_currency"] = base_currency
         SESSION["logged_in_at"] = datetime.now().isoformat()
         logger.info(
-            "client_details Waehrungsfelder: currency=%s baseCurrency=%s -> verwendet=%s",
+            "Konto-Waehrung: client_details.currency=%s client_details.baseCurrency=%s cashFunds=%s -> verwendet=%s",
             client_details.get("data", {}).get("currency"),
             client_details.get("data", {}).get("baseCurrency"),
+            cash_currency,
             SESSION["base_currency"],
         )
         # Nur im RAM fuer die Dauer dieser Sitzung - nie auf Platte geschrieben.
@@ -838,19 +861,21 @@ def _get_cash_and_deposits_history_chf(
     Liefert (Cash-Historie, kumulierte Netto-Einzahlungs-Historie), beide
     taeglich in CHF.
 
-    Cash-Historie: letzter gemeldeter Saldo je Tag aus DEGIROs eigenen
-    'cashMovements'. Diese Rohsumme misst etwas anderes als das separat live
-    abgefragte "available to trade"-Guthaben (cashFunds) - z.B. reservierte /
-    noch nicht abgewickelte Betraege, Sollsalden in einer Fremdwaehrung o.ae.
-    Ein direkter Wertabgleich beider Groessen schlaegt deshalb strukturell
-    fast immer fehl, selbst wenn die Rekonstruktion an sich korrekt ist (das
-    war der Grund, warum diese Funktion vorher fuer dieses Konto dauerhaft
-    leer zurueckgab und die einzahlungsbereinigte %-Performance nie etwas
-    anzeigte). Statt bei Abweichung zu verwerfen, wird die rekonstruierte
-    Tag-zu-Tag-FORM beibehalten und die gesamte Serie um eine Konstante
+    Cash-Historie: rekonstruiert durch Aufsummieren des "change"-Deltas jeder
+    einzelnen Buchung aus DEGIROs 'cashMovements' (raw=False, also das
+    typisierte degiro_connector-Modell: jede Buchung hat ein klar definiertes
+    change:float in ihrer eigenen currency:str). Das im rohen JSON gelieferte
+    "balance"-Feld je Buchung (ein Momentaufnahme-Saldo je Waehrung) wurde
+    zuvor verwendet, war aber fuer dieses Konto durchgehend leer/0 (egal ob
+    die chronologisch letzte oder eine "nicht-leere" Buchung des Tages
+    gewaehlt wurde) und lieferte dadurch eine komplett flache, falsche Kurve -
+    das trieb die einzahlungsbereinigte %-Performance auf unsinnige Werte
+    (z.B. +18%, obwohl der Gesamtwert unter der Einzahlung lag). Die
+    kumulierte Delta-Summe hat dieses Problem nicht, braucht aber trotzdem
+    eine Verankerung: die absolute Summe ab since_d kennt keine Aktivitaet
+    von VOR since_d, daher wird die gesamte Serie um eine Konstante
     verschoben, sodass sie am letzten bekannten Tag exakt dem live
-    abgefragten Wert entspricht - das verankert die Kurve korrekt, ohne die
-    relative Bewegung (aus der Ein-/Auszahlungen erkannt werden) zu verlieren.
+    abgefragten "available to trade"-Guthaben entspricht.
 
     Netto-Einzahlungen: NICHT durch Klassifizieren einzelner Kontobuchungen
     bestimmt (zwei Anlaeufe damit - ueber 'type' geraten, dann ueber
@@ -880,49 +905,32 @@ def _get_cash_and_deposits_history_chf(
     try:
         overview = trading_api.get_account_overview(
             overview_request=OverviewRequest(from_date=since_d, to_date=date.today()),
-            raw=True,
+            raw=False,
         )
-        movements = ((overview or {}).get("data") or {}).get("cashMovements") or []
+        movements = (overview.cash_movements if overview else None) or []
     except Exception:  # noqa: BLE001
         logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
         movements = []
 
     logger.info("cashMovements: %d Eintraege gefunden (seit %s)", len(movements), since_d.isoformat())
 
-    # Pro Tag koennen mehrere Buchungen vorliegen (Zinsen, Gebuehren, Trades,
-    # Ein-/Auszahlungen...); nicht jede davon traegt zwangslaeufig einen
-    # vollstaendigen 'balance'-Schnappschuss (manche Buchungstypen liefern
-    # dort vermutlich ein leeres/fehlendes Feld). Wird chronologisch einfach
-    # die LETZTE Buchung des Tages genommen, kann das zufaellig eine ohne
-    # Saldo sein, obwohl eine fruehere Buchung desselben Tages einen echten
-    # Saldo hatte - das ergab beobachtet einen rekonstruierten Saldo von
-    # exakt 0.00 an Tagen mit echter Kontoaktivitaet. Deshalb: je Tag die
-    # letzte Buchung MIT einem nicht-leeren balance-Feld bevorzugen, nur bei
-    # komplettem Fehlen eine balance-lose Buchung als Fallback nehmen.
-    by_day_last: dict[str, dict] = {}
-    for m in sorted(movements, key=lambda m: str(m.get("date") or "")):
-        d = str(m.get("date") or "")[:10]
-        if not d:
+    daily_delta_chf: dict[str, float] = {}
+    skipped = 0
+    for m in movements:
+        if m.date is None or m.change is None:
+            skipped += 1
             continue
-        balance = m.get("balance")
-        if isinstance(balance, dict) and balance:
-            by_day_last[d] = m
-        elif d not in by_day_last:
-            by_day_last[d] = m
+        day = m.date.date()
+        d = day.isoformat()
+        daily_delta_chf[d] = daily_delta_chf.get(d, 0.0) + _to_chf(m.currency, m.change, day)
+    if skipped:
+        logger.info("cashMovements: %d von %d Buchungen ohne date/change uebersprungen", skipped, len(movements))
 
     cash_result: dict[str, float] = {}
-    empty_balance_days = 0
-    for d, movement in sorted(by_day_last.items()):
-        balance = movement.get("balance") or {}
-        if not balance:
-            empty_balance_days += 1
-        day = date.fromisoformat(d)
-        cash_result[d] = sum(_to_chf(ccy, amount, day) for ccy, amount in balance.items())
-    if empty_balance_days:
-        logger.info(
-            "cashMovements: %d von %d Tagen ohne balance-Feld in irgendeiner Buchung dieses Tages",
-            empty_balance_days, len(by_day_last),
-        )
+    running = 0.0
+    for d in sorted(daily_delta_chf):
+        running += daily_delta_chf[d]
+        cash_result[d] = running
 
     if cash_result and live_cash_chf is not None:
         last_day = max(cash_result)
