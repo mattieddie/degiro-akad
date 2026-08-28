@@ -1,27 +1,24 @@
 """
-Lokaler DEGIRO-Proxy + Web-App fuer das degiro-akad Dashboard.
+Lokaler DEGIRO-Proxy fuer das degiro-akad Dashboard.
 
-Laeuft NUR auf deinem eigenen Rechner (127.0.0.1). Liefert die Web-Oberflaeche
-(index.html/assets/*) direkt selbst mit aus und leitet API-Anfragen an DEGIRO
-(und an eine oeffentliche, kostenlose FX-API fuer Waehrungsumrechnung) weiter.
-Es wird NICHTS auf die Festplatte oder nach GitHub geschrieben - Login-Daten
-und DEGIRO-Antworten leben ausschliesslich im Arbeitsspeicher dieses
-Prozesses, solange er laeuft. Beendest du das Skript (Strg+C), ist alles weg.
+Laeuft NUR auf deinem eigenen Rechner (127.0.0.1) und leitet Anfragen von der
+GitHub-Pages-Seite an DEGIRO (und an eine oeffentliche, kostenlose FX-API fuer
+Waehrungsumrechnung) weiter. Es wird NICHTS auf die Festplatte oder nach
+GitHub geschrieben - Login-Daten und DEGIRO-Antworten leben ausschliesslich
+im Arbeitsspeicher dieses Prozesses, solange er laeuft. Beendest du das
+Skript (Strg+C), ist alles weg.
 
 Start:
     pip install -r requirements.txt
     python proxy.py
 
-Dann im Browser oeffnen: http://127.0.0.1:8765/
-
 Optional:
-    python proxy.py --port 8765
+    python proxy.py --port 8765 --origin https://mattieddie.github.io
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import secrets
@@ -30,7 +27,7 @@ from datetime import date, datetime, timedelta
 from functools import wraps
 
 import requests
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 
 from degiro_connector.core.exceptions import DeGiroConnectionError
 from degiro_connector.quotecast.models.chart import ChartRequest, Interval
@@ -71,6 +68,10 @@ TARGET_CURRENCY = "CHF"
 #   PowerShell:  $env:FMP_API_KEY = "dein-key"; python proxy.py
 #   bash:        FMP_API_KEY=dein-key python proxy.py
 FMP_API_KEY = os.environ.get("FMP_API_KEY")
+
+# Wird beim Start einmalig erzeugt und in der Konsole ausgegeben. Die Seite
+# muss dieses Token kennen, um den Proxy ansprechen zu duerfen.
+PROXY_TOKEN = secrets.token_urlsafe(24)
 
 ALLOWED_ORIGINS: list[str] = []
 
@@ -474,27 +475,14 @@ def resolve_price_series(
 
 
 # --- Auth-Decorators ---------------------------------------------------------
-# Gleiches Cookie-Sitzungsmodell wie das Vercel-Backend (api/index.py), nur
-# dass die Sitzung hier in einem einfachen In-Memory-Dict liegt statt einem
-# externen KV-Store - unproblematisch, weil dieser Prozess (anders als eine
-# Vercel-Funktion) durchgehend als EIN langlebiger Prozess laeuft. Kein
-# separates Proxy-Token mehr noetig: der Proxy ist ohnehin nur ueber
-# 127.0.0.1 erreichbar, also nur von diesem einen Rechner aus.
-
-SESSION_STORE: dict[str, dict] = {}
-SESSION_COOKIE = "degiro_session"
-SESSION_MAX_AGE = 60 * 60 * 12
-
 
 def require_auth(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        session_id = request.cookies.get(SESSION_COOKIE, "")
-        stored = SESSION_STORE.get(session_id)
-        SESSION.update(stored or {
-            "trading_api": None, "int_account": None, "user_token": None,
-            "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
-        })
+        auth = request.headers.get("Authorization", "")
+        token = auth.removeprefix("Bearer ").strip()
+        if not secrets.compare_digest(token, PROXY_TOKEN):
+            return jsonify({"error": "Ungueltiges oder fehlendes Proxy-Token"}), 401
         return fn(*args, **kwargs)
 
     return wrapper
@@ -516,9 +504,8 @@ def add_cors_headers(response):
     if origin and origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Vary"] = "Origin"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
 
@@ -527,27 +514,9 @@ def options_handler(_any):
     return ("", 204)
 
 
-# --- Statische Seiten (index.html, assets/*) --------------------------------
-# Damit du die App direkt unter http://127.0.0.1:8765/ oeffnen kannst (kein
-# GitHub Pages noetig) - dasselbe Frontend wie beim Vercel-Deployment.
-
-STATIC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-@app.route("/", methods=["GET"])
-def serve_index():
-    return send_from_directory(STATIC_ROOT, "index.html")
-
-
-@app.route("/assets/<path:filename>", methods=["GET"])
-def serve_assets(filename):
-    return send_from_directory(os.path.join(STATIC_ROOT, "assets"), filename)
-
-
 # --- Endpunkte: Verbindung ---------------------------------------------------
 
 @app.route("/api/health", methods=["GET"])
-@require_auth
 def health():
     return jsonify({
         "status": "ok",
@@ -561,6 +530,11 @@ def health():
 
 @app.route("/api/login", methods=["POST"])
 def login():
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if not secrets.compare_digest(token, PROXY_TOKEN):
+        return jsonify({"error": "Ungueltiges oder fehlendes Proxy-Token"}), 401
+
     body = request.get_json(silent=True) or {}
     username = body.get("username")
     password = body.get("password")
@@ -586,28 +560,20 @@ def login():
         user_token = client_details["data"]["id"]
         trading_api.credentials.int_account = int_account
 
-        base_currency = detect_base_currency(client_details)
-        session_id = secrets.token_urlsafe(32)
-        SESSION_STORE[session_id] = {
-            "trading_api": trading_api,
-            "int_account": int_account,
-            "user_token": user_token,
-            "base_currency": base_currency,
-            "logged_in_at": datetime.now().isoformat(),
-            "fmp_api_key": fmp_api_key,
-        }
+        SESSION["trading_api"] = trading_api
+        SESSION["int_account"] = int_account
+        SESSION["user_token"] = user_token
+        SESSION["base_currency"] = detect_base_currency(client_details)
+        SESSION["logged_in_at"] = datetime.now().isoformat()
+        # Nur im RAM fuer die Dauer dieser Sitzung - nie auf Platte geschrieben.
+        # Ueberschreibt bewusst nicht mit None, falls dieses Login-Formular
+        # ohne Key abgeschickt wurde, aber vorher schon einer per Umgebungs-
+        # variable galt (siehe get_fmp_api_key()).
+        if fmp_api_key:
+            SESSION["fmp_api_key"] = fmp_api_key
 
-        logger.info("Login erfolgreich (int_account=%s, base_currency=%s)", int_account, base_currency)
-        response = jsonify({"success": True, "baseCurrency": base_currency})
-        response.set_cookie(
-            SESSION_COOKIE,
-            session_id,
-            max_age=SESSION_MAX_AGE,
-            httponly=True,
-            secure=False,  # laeuft nur auf http://127.0.0.1, kein HTTPS lokal
-            samesite="Lax",
-        )
-        return response
+        logger.info("Login erfolgreich (int_account=%s, base_currency=%s)", int_account, SESSION["base_currency"])
+        return jsonify({"success": True, "baseCurrency": SESSION["base_currency"]})
     except DeGiroConnectionError as e:
         logger.warning("DEGIRO-Loginfehler: %s", e)
         return jsonify({"error": f"DEGIRO-Loginfehler: {e}"}), 401
@@ -649,15 +615,11 @@ def logout():
             trading_api.logout()
         except Exception:  # noqa: BLE001
             pass
-    session_id = request.cookies.get(SESSION_COOKIE, "")
-    SESSION_STORE.pop(session_id, None)
     SESSION.update({
         "trading_api": None, "int_account": None, "user_token": None,
         "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
     })
-    response = jsonify({"success": True})
-    response.delete_cookie(SESSION_COOKIE)
-    return response
+    return jsonify({"success": True})
 
 
 # --- Endpunkte: Portfolio -----------------------------------------------------
@@ -847,13 +809,6 @@ def _get_cash_and_deposits_history_chf(
         logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
         movements = []
 
-    # Diagnose: bisher wurde die Cash-Rekonstruktion aus 'balance' fuer dieses
-    # Konto konsequent verworfen. Bevor hier weiter geraten wird, einmal die
-    # tatsaechliche Rohstruktur ins Log schreiben (Konsole von proxy.py).
-    logger.info("cashMovements: %d Eintraege gefunden", len(movements))
-    for m in movements[:3]:
-        logger.info("  Beispiel-Buchung: %s", json.dumps(m, default=str, ensure_ascii=False))
-
     by_day_last: dict[str, dict] = {}
     for m in sorted(movements, key=lambda m: str(m.get("date") or "")):
         d = str(m.get("date") or "")[:10]
@@ -875,17 +830,8 @@ def _get_cash_and_deposits_history_chf(
             )
             cash_result = {}
 
-    # WICHTIG: die Netto-Einzahlungs-Herleitung (weiter unten) braucht die
-    # ECHTE taegliche Cash-Historie. Ein flacher Naeherungswert als Ersatz
-    # wurde hier testweise versucht und war nachweislich falsch: er erzeugt
-    # an jedem Handelstag eine scheinbare "Einzahlung" in Hoehe des
-    # Handels-Cashflows (da ein konstanter Cash-Stand + ein negativer
-    # Handels-Cashflow rechnerisch wie eine Einzahlung aussieht), reproduziert
-    # also die urspruengliche Verzerrung nur in neuer Form. Daher hier bewusst
-    # KEIN Fallback: ohne verlaessliche Cash-Historie lieber keine
-    # Netto-Einzahlungs-Kurve zeigen als eine falsche.
     if not cash_result:
-        return cash_result, {}
+        return {}, {}
 
     trade_cashflow_by_day: dict[str, float] = {}
     running = 0.0
@@ -1269,7 +1215,9 @@ def main():
     print(" DEGIRO-Proxy laeuft lokal. Nichts wird gespeichert oder an GitHub gesendet.")
     print(" Waehrungsumrechnung nach CHF via api.frankfurter.app (oeffentliche EZB-Kurse).")
     print(f" Kursquellen: DEGIRO, Yahoo Finance, Financial Modeling Prep ({'aktiv' if FMP_API_KEY else 'kein FMP_API_KEY gesetzt - uebersprungen'})")
-    print(f" Oeffne im Browser: http://127.0.0.1:{args.port}/")
+    print(f" Erlaubte Herkunft(en): {', '.join(ALLOWED_ORIGINS)}")
+    print(f" Proxy-Token (in der Webseite eintragen): {PROXY_TOKEN}")
+    print(f" Adresse: http://127.0.0.1:{args.port}")
     print(" Beenden mit Strg+C")
     print("=" * 70)
 
