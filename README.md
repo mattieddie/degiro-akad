@@ -119,28 +119,28 @@ Der Graph kombiniert zwei Quellen:
 1. **Seit-Kauf-Rekonstruktion** (`/api/history/backfill`): Der Proxy
    berechnet beim Verbinden aus deiner kompletten Transaktionshistorie plus
    Kurscharts einen Best-Effort-Verlauf zurück bis zu deinem ersten Kauf.
-   Da DEGIROs Kurschart-Rohformat nicht offiziell dokumentiert ist, wird
-   jede Kursserie automatisch gegen den separat gemeldeten Schlusskurs
-   geprüft:
-   - **`degiro` (verifiziert)**: DEGIROs eigenes Kurschart, Prüfung erfolgreich.
-   - **`yahoo` (verifiziert)**: DEGIROs Chart war nicht abrufbar oder nicht
-     verifizierbar – die Kursdaten wurden stattdessen von der öffentlichen,
-     unauthentifizierten Chart-API von Yahoo Finance bezogen (Symbol wird
-     über die ISIN aufgelöst) **und** erfolgreich gegen DEGIROs gemeldeten
-     Schlusskurs geprüft.
-   - **nicht verwendet**: Weder DEGIRO noch Yahoo lieferten Daten, die zum
-     von DEGIRO gemeldeten Schlusskurs passen (z.B. weil Yahoo mangels
-     ISIN-Treffer ein falsches Instrument zurückgab) – in diesem Fall wird
-     **nichts Ungeprüftes verwendet**, sondern ein Näherungswert (letzter
-     bekannter Kurs, flach). Ein einzelner nicht passender Datenpunkt ist
-     damit nie die Ursache für einen falschen Ausschlag im Graphen.
+   Quellen der Reihe nach: DEGIROs eigenes Kurschart → Yahoo Finance
+   (Symbol über ISIN aufgelöst) → Financial Modeling Prep (falls
+   `FMP_API_KEY` gesetzt). Die **erste Quelle, die überhaupt Daten liefert,
+   wird verwendet** – unabhängig davon, ob der Schlusskurs exakt mit dem von
+   DEGIRO separat gemeldeten übereinstimmt (kleine Abweichungen zwischen
+   Anbietern, z.B. durch Dividenden-Anpassung oder Handelsschluss-Zeitpunkt,
+   sind normal). Ob eine Serie exakt übereinstimmt, wird nur noch informativ
+   als `verified` mitgeliefert, entscheidet aber nicht mehr über die
+   Verwendung. Nur wenn **keine** der drei Quellen überhaupt Daten liefert,
+   wird ein Näherungswert (letzter bekannter Kurs, flach) verwendet.
 
+   Schutz gegen grob falsch skalierte Daten (z.B. ein durch eine
+   fehlgeschlagene ISIN-Suche falsch getroffenes Instrument) bleibt trotzdem
+   bestehen, nur lockerer als eine exakte Kurs-Prüfung: ein einzelner Tag,
+   der um mehr als das 5-fache vom vorherigen bekannten Kurs abweicht, wird
+   beim Aufbau der Wertkurve verworfen (letzter guter Kurs bleibt stehen).
    Zusätzlich wird die rekonstruierte Cash-Historie gegen den tatsächlichen,
    live abgefragten Cash-Stand geprüft und bei starker Abweichung verworfen
    (flache Linie mit dem echten aktuellen Wert statt einer falschen Kurve).
 
    Die Seite zeigt dir unter dem Graphen und im Positions-Popup an, welche
-   Quelle jeweils tatsächlich verwendet wurde.
+   Quelle jeweils verwendet wurde und ob sie verifiziert war.
 2. **Lokale Tages-Schnappschüsse**: Zusätzlich wird bei jedem Öffnen der
    Seite mit laufendem Proxy ein exakter Datenpunkt für den heutigen Tag
    gespeichert (localStorage). Für bereits erfasste Tage überschreibt dieser

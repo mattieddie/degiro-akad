@@ -394,34 +394,35 @@ def resolve_price_series(
 ) -> tuple[dict[str, float], str, bool, str]:
     """
     Liefert (Serie, Quelle, verifiziert, Waehrung_der_Serie). Reihenfolge:
-    1. DEGIRO-Kurschart, falls gegen DEGIROs eigenen Schlusskurs verifizierbar.
-    2. Yahoo Finance (oeffentlich, ueber ISIN aufgeloest), falls verifizierbar.
-    3. Financial Modeling Prep (nur falls FMP_API_KEY gesetzt), falls verifizierbar.
-    4. Letzter unverifizierter Versuch (DEGIRO oder Yahoo) nur zu Info-Zwecken -
-       wird vom Aufrufer wegen usable=verified NICHT fuer echte Werte benutzt.
-    5. Nichts gefunden.
-    Bei 2. und 3. wird eine etwas grosszuegigere Toleranz verwendet, da
-    unterschiedliche Datenanbieter leicht abweichende Schlusskurse melden koennen.
+    1. DEGIRO-Kurschart, falls Daten vorhanden.
+    2. Yahoo Finance (oeffentlich, ueber ISIN aufgeloest), falls DEGIRO nichts liefert.
+    3. Financial Modeling Prep (nur falls FMP_API_KEY gesetzt), falls auch Yahoo nichts liefert.
+    4. Nichts gefunden.
+
+    "verified" ist nur noch eine Info-Kennzeichnung (Abgleich gegen DEGIROs
+    separat gemeldeten Schlusskurs) und entscheidet NICHT mehr, ob die Serie
+    verwendet wird - auf Wunsch, da eine leicht abweichende Schlusskurs-Meldung
+    zwischen Anbietern (Datum/Uhrzeit-Cutoff, Dividenden-Anpassung) haeufiger
+    vorkommt als ein tatsaechlich falsches Instrument. Schutz gegen grob falsch
+    skalierte Daten (z.B. falsches Instrument) bleibt ueber den
+    Tag-zu-Tag-Ausreisserfilter beim Aufbau der Wertkurve bestehen.
     """
-    degiro_series: dict[str, float] = {}
     if vwd_id:
         degiro_series = fetch_daily_close_series(user_token, vwd_id, since_d)
-        if verify_series(degiro_series, close_price, close_price_date):
-            return degiro_series, "degiro", True, currency
+        if degiro_series:
+            verified = verify_series(degiro_series, close_price, close_price_date)
+            return degiro_series, "degiro", verified, currency
 
     yahoo_series, yahoo_ccy = fetch_yahoo_daily_close_series(isin, symbol, since_d)
-    if yahoo_series and verify_series(yahoo_series, close_price, close_price_date, tolerance_pct=0.03):
-        return yahoo_series, "yahoo", True, (yahoo_ccy or currency)
+    if yahoo_series:
+        verified = verify_series(yahoo_series, close_price, close_price_date, tolerance_pct=0.03)
+        return yahoo_series, "yahoo", verified, (yahoo_ccy or currency)
 
     if FMP_API_KEY:
         fmp_series, fmp_ccy = fetch_fmp_daily_close_series(isin, since_d)
-        if fmp_series and verify_series(fmp_series, close_price, close_price_date, tolerance_pct=0.03):
-            return fmp_series, "fmp", True, (fmp_ccy or currency)
-
-    if degiro_series:
-        return degiro_series, "degiro", False, currency
-    if yahoo_series:
-        return yahoo_series, "yahoo", False, (yahoo_ccy or currency)
+        if fmp_series:
+            verified = verify_series(fmp_series, close_price, close_price_date, tolerance_pct=0.03)
+            return fmp_series, "fmp", verified, (fmp_ccy or currency)
 
     return {}, "none", False, currency
 
@@ -878,17 +879,22 @@ def history_backfill():
                 SESSION["user_token"], vwd_id, info.get("isin"), info.get("symbol"), currency,
                 info.get("closePrice"), str(info.get("closePriceDate") or "")[:10], first_date,
             )
-            # Nur verifizierte Daten verwenden - egal ob Quelle DEGIRO oder Yahoo.
-            # Ein unverifizierter Yahoo-Treffer kann (z.B. bei Symbol-Kollisionen
-            # nach fehlgeschlagener ISIN-Suche) ein voellig falsches Instrument
-            # sein, nicht nur eine leicht abweichende Kursnotierung.
-            usable = verified
+            # Jede gefundene Serie wird verwendet, unabhaengig davon, ob sie
+            # exakt gegen DEGIROs gemeldeten Schlusskurs passt (auf Wunsch -
+            # kleine anbieterbedingte Abweichungen sind normal). Schutz gegen
+            # grob falsch skalierte Daten bleibt der Tag-zu-Tag-Ausreisserfilter
+            # weiter unten.
+            usable = source != "none"
 
             fx_series = get_fx_series(first_date, date.today(), series_currency, TARGET_CURRENCY)
             fallback_price = _num(info.get("closePrice")) or 0.0
+            # Mit dem aeltesten bekannten Kurs starten, nicht mit dem heutigen -
+            # sonst wuerde bei stark gewachsenen Positionen der Ausreisserfilter
+            # unten den allerersten echten Kurs faelschlich verwerfen.
+            initial_price = price_series[min(price_series.keys())] if (usable and price_series) else fallback_price
 
             qty_running = 0.0
-            price_running = fallback_price
+            price_running = initial_price
             d = first_date
             while d <= date.today():
                 iso = d.isoformat()
@@ -941,7 +947,7 @@ def history_backfill():
             "since": earliest.isoformat(),
             "series": series,
             "positions": per_product_meta,
-            "note": "used=true: echter Kursverlauf verwendet (source=degiro/yahoo/fmp, jeweils gegen DEGIROs Schlusskurs verifiziert). used=false: kein verifizierter Kursverlauf gefunden, es wird ein Naeherungswert (letzter bekannter Kurs, flach) verwendet. netDepositsChf: kumulierte Netto-Einzahlungen (Basis der einzahlungsbereinigten %-Performance).",
+            "note": "used=true: echter Kursverlauf verwendet (source=degiro/yahoo/fmp; verified zeigt nur informativ an, ob er exakt zu DEGIROs gemeldetem Schlusskurs passt - entscheidet aber nicht mehr, ob er verwendet wird). used=false: keine der drei Quellen lieferte ueberhaupt Daten, es wird ein Naeherungswert (letzter bekannter Kurs, flach) verwendet. netDepositsChf: kumulierte Netto-Einzahlungen (Basis der einzahlungsbereinigten %-Performance).",
         })
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler bei der Historien-Rekonstruktion")
@@ -974,11 +980,9 @@ def position_history():
             SESSION["user_token"], vwd_id, info.get("isin"), info.get("symbol"), currency,
             info.get("closePrice"), str(info.get("closePriceDate") or "")[:10], first_date,
         )
-        # Nur verifizierte Daten verwenden - egal ob Quelle DEGIRO oder Yahoo.
-        # Ein unverifizierter Yahoo-Treffer kann (z.B. bei Symbol-Kollisionen
-        # nach fehlgeschlagener ISIN-Suche) ein voellig falsches Instrument
-        # sein, nicht nur eine leicht abweichende Kursnotierung.
-        usable = verified
+        # Jede gefundene Serie wird angezeigt, unabhaengig davon, ob sie exakt
+        # gegen DEGIROs gemeldeten Schlusskurs passt (auf Wunsch).
+        usable = source != "none"
         if not usable:
             price_series = {}
 
@@ -990,10 +994,11 @@ def position_history():
             series.append({"date": d_str, "priceNative": price, "priceChf": round(price * fx, 4)})
 
         if usable:
+            verified_txt = "gegen DEGIROs gemeldeten Schlusskurs abgeglichen" if verified else "nicht exakt gegen DEGIROs Schlusskurs abgleichbar, trotzdem angezeigt"
             notes = {
-                "degiro": "Kursverlauf von DEGIRO, gegen den gemeldeten Schlusskurs validiert.",
-                "yahoo": "DEGIROs Kurschart war nicht verfuegbar/verifizierbar - Kursdaten stattdessen von Yahoo Finance bezogen und erfolgreich validiert.",
-                "fmp": "DEGIRO und Yahoo Finance nicht verifizierbar - Kursdaten stattdessen von Financial Modeling Prep bezogen und erfolgreich validiert.",
+                "degiro": f"Kursverlauf von DEGIRO ({verified_txt}).",
+                "yahoo": f"Kursdaten von Yahoo Finance bezogen ({verified_txt}).",
+                "fmp": f"Kursdaten von Financial Modeling Prep bezogen ({verified_txt}).",
             }
             note = notes[source]
         else:
