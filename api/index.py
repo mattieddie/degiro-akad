@@ -632,7 +632,9 @@ def logout():
         "trading_api": None, "int_account": None, "user_token": None,
         "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
     })
-    return jsonify({"success": True})
+    response = jsonify({"success": True})
+    response.delete_cookie(SESSION_COOKIE)
+    return response
 
 
 # --- Endpunkte: Portfolio -----------------------------------------------------
@@ -774,34 +776,43 @@ def transactions():
 # --- Endpunkte: Historie (seit Kauf, in CHF) ---------------------------------
 
 def _get_cash_and_deposits_history_chf(
-    trading_api, since_d: date, live_cash_chf: float | None, tx_items: list[dict], base_currency: str
+    trading_api, since_d: date, live_cash_chf: float | None
 ) -> tuple[dict[str, float], dict[str, float]]:
     """
     Liefert (Cash-Historie, kumulierte Netto-Einzahlungs-Historie), beide
-    taeglich in CHF.
+    taeglich in CHF, aus DEGIROs eigenen 'cashMovements'.
 
-    Cash-Historie: letzter gemeldeter Saldo je Tag aus DEGIROs eigenen
-    'cashMovements'. Wird gegen den live abgefragten aktuellen Cash-Stand
-    geprueft; weicht der letzte rekonstruierte Wert stark davon ab, ist das
-    'balance'-Format vermutlich nicht so wie angenommen (nicht offiziell
-    dokumentiert) - dann leer zurueckgeben (Aufrufer faellt auf eine flache,
-    korrekte Linie zurueck).
+    Cash-Historie: letzter gemeldeter Saldo je Tag. Wird gegen den live
+    abgefragten aktuellen Cash-Stand geprueft; weicht der letzte
+    rekonstruierte Wert stark davon ab, ist das 'balance'-Format vermutlich
+    nicht so wie angenommen (nicht offiziell dokumentiert) - dann leer
+    zurueckgeben (Aufrufer faellt auf eine flache, korrekte Linie zurueck).
 
-    Netto-Einzahlungen: NICHT durch Klassifizieren einzelner Kontobuchungen
-    bestimmt (zwei Anlaeufe damit - ueber 'type' geraten, dann ueber
-    Anwesenheit von 'productId' - waren beide nachweislich falsch: manche
-    Einzahlungen/Sweeps in den Cash-Fund tragen offenbar auch eine productId
-    und wurden faelschlich als Handel statt als Einzahlung gezaehlt, was die
-    Kennzahl bei jeder so verpassten Einzahlung sprunghaft nach oben trieb).
-    Stattdessen rein rechnerisch aus zwei bereits verlaesslichen Groessen
-    hergeleitet:
-        NettoEinzahlungen(t) = Cash-Saldo(t) - kumulierter Handels-Cashflow(t)
-    Der Handels-Cashflow kommt direkt aus der Transaktionshistorie (bereits
-    an anderer Stelle erfolgreich genutzt), nicht aus den mehrdeutigen
-    Kontobuchungen. Diese Herleitung setzt voraus, dass der Cash-Saldo am
-    allerersten Tag (since_d) noch keine Aktivität von vor since_d enthält -
-    zutreffend, da since_d der Tag der ersten je getaetigten Transaktion ist.
+    Netto-Einzahlungen: laufende Summe aller Buchungen OHNE productId (also
+    Bank-Ein-/Auszahlungen, nicht an ein Wertpapier gebundene Buchungen).
+    Buchungen MIT productId (Handel, Dividenden, Zinsen auf eine Position)
+    zaehlen bewusst NICHT als "Einzahlung" - so verzerrt das Kaufen
+    zusaetzlicher Aktien mit vorhandenem Kapital die Performance-Kennzahl
+    nicht, nur tatsaechlich frisch eingezahltes Geld tut das.
     """
+    try:
+        overview = trading_api.get_account_overview(
+            overview_request=OverviewRequest(from_date=since_d, to_date=date.today()),
+            raw=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
+        return {}, {}
+
+    movements = ((overview or {}).get("data") or {}).get("cashMovements") or []
+    if not movements:
+        return {}, {}
+
+    # Nicht auf die von der API gelieferte Reihenfolge verlassen - explizit
+    # chronologisch sortieren, damit "letzter Eintrag pro Tag" wirklich der
+    # spaeteste ist (manche Endpunkte liefern neueste zuerst).
+    movements_sorted = sorted(movements, key=lambda m: str(m.get("date") or ""))
+
     fx_cache_series: dict[str, dict[str, float]] = {}
 
     def _to_chf(ccy, amount, day: date) -> float:
@@ -812,18 +823,8 @@ def _get_cash_and_deposits_history_chf(
             fx_cache_series[ccy] = get_fx_series(since_d, date.today(), ccy, TARGET_CURRENCY)
         return _num(amount) * fx_rate_on(fx_cache_series[ccy], day, fallback=1.0)
 
-    try:
-        overview = trading_api.get_account_overview(
-            overview_request=OverviewRequest(from_date=since_d, to_date=date.today()),
-            raw=True,
-        )
-        movements = ((overview or {}).get("data") or {}).get("cashMovements") or []
-    except Exception:  # noqa: BLE001
-        logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
-        movements = []
-
     by_day_last: dict[str, dict] = {}
-    for m in sorted(movements, key=lambda m: str(m.get("date") or "")):
+    for m in movements_sorted:
         d = str(m.get("date") or "")[:10]
         if d:
             by_day_last[d] = m
@@ -843,30 +844,16 @@ def _get_cash_and_deposits_history_chf(
             )
             cash_result = {}
 
-    if not cash_result:
-        return {}, {}
-
-    trade_cashflow_by_day: dict[str, float] = {}
-    running = 0.0
-    for t in sorted(tx_items, key=lambda x: str(x.get("date"))):
-        d = str(t.get("date"))[:10]
-        amount = t.get("totalPlusAllFeesInBaseCurrency")
-        if amount is None:
-            amount = t.get("totalInBaseCurrency")
-        day = date.fromisoformat(d)
-        running += _to_chf(base_currency, amount, day)
-        trade_cashflow_by_day[d] = running
-
-    filled_trade_cf = _forward_fill(trade_cashflow_by_day, since_d, date.today())
-    trade_cf_by_day = {c["date"]: (c["value"] or 0.0) for c in filled_trade_cf}
-    filled_cash = _forward_fill(cash_result, since_d, date.today())
-
     deposits_result: dict[str, float] = {}
-    for c in filled_cash:
-        d = c["date"]
-        if c["value"] is None:
+    running = 0.0
+    for m in movements_sorted:
+        if m.get("productId") is not None:
             continue
-        deposits_result[d] = c["value"] - trade_cf_by_day.get(d, 0.0)
+        d = str(m.get("date") or "")[:10]
+        if not d:
+            continue
+        running += _to_chf(m.get("currency"), m.get("change"), date.fromisoformat(d))
+        deposits_result[d] = running
 
     return cash_result, deposits_result
 
@@ -931,9 +918,7 @@ def history_backfill():
         live_cash_amount, live_cash_ccy = _get_cash_available_to_trade(account_update)
         live_cash_chf = live_cash_amount * get_latest_fx_rate(live_cash_ccy, TARGET_CURRENCY)
 
-        cash_series, deposits_series = _get_cash_and_deposits_history_chf(
-            trading_api, earliest, live_cash_chf, tx_items, base_currency
-        )
+        cash_series, deposits_series = _get_cash_and_deposits_history_chf(trading_api, earliest, live_cash_chf)
         if not cash_series:
             # Rekonstruktion nicht verfuegbar/unplausibel - flache Linie mit dem
             # tatsaechlichen aktuellen Cash-Stand ist ehrlicher als eine falsche Kurve.
@@ -1230,6 +1215,7 @@ def main():
     print(f" Kursquellen: DEGIRO, Yahoo Finance, Financial Modeling Prep ({'aktiv' if FMP_API_KEY else 'kein FMP_API_KEY gesetzt - uebersprungen'})")
     print(f" Erlaubte Herkunft(en): {', '.join(ALLOWED_ORIGINS)}")
     print(f" Adresse: http://127.0.0.1:{args.port}")
+
     print(" Beenden mit Strg+C")
     print("=" * 70)
 
