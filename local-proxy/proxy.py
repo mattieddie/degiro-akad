@@ -768,11 +768,18 @@ def _get_cash_and_deposits_history_chf(
     taeglich in CHF.
 
     Cash-Historie: letzter gemeldeter Saldo je Tag aus DEGIROs eigenen
-    'cashMovements'. Wird gegen den live abgefragten aktuellen Cash-Stand
-    geprueft; weicht der letzte rekonstruierte Wert stark davon ab, ist das
-    'balance'-Format vermutlich nicht so wie angenommen (nicht offiziell
-    dokumentiert) - dann leer zurueckgeben (Aufrufer faellt auf eine flache,
-    korrekte Linie zurueck).
+    'cashMovements'. Diese Rohsumme misst etwas anderes als das separat live
+    abgefragte "available to trade"-Guthaben (cashFunds) - z.B. reservierte /
+    noch nicht abgewickelte Betraege, Sollsalden in einer Fremdwaehrung o.ae.
+    Ein direkter Wertabgleich beider Groessen schlaegt deshalb strukturell
+    fast immer fehl, selbst wenn die Rekonstruktion an sich korrekt ist (das
+    war der Grund, warum diese Funktion vorher fuer dieses Konto dauerhaft
+    leer zurueckgab und die einzahlungsbereinigte %-Performance nie etwas
+    anzeigte). Statt bei Abweichung zu verwerfen, wird die rekonstruierte
+    Tag-zu-Tag-FORM beibehalten und die gesamte Serie um eine Konstante
+    verschoben, sodass sie am letzten bekannten Tag exakt dem live
+    abgefragten Wert entspricht - das verankert die Kurve korrekt, ohne die
+    relative Bewegung (aus der Ein-/Auszahlungen erkannt werden) zu verlieren.
 
     Netto-Einzahlungen: NICHT durch Klassifizieren einzelner Kontobuchungen
     bestimmt (zwei Anlaeufe damit - ueber 'type' geraten, dann ueber
@@ -809,26 +816,52 @@ def _get_cash_and_deposits_history_chf(
         logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
         movements = []
 
+    logger.info("cashMovements: %d Eintraege gefunden (seit %s)", len(movements), since_d.isoformat())
+
+    # Pro Tag koennen mehrere Buchungen vorliegen (Zinsen, Gebuehren, Trades,
+    # Ein-/Auszahlungen...); nicht jede davon traegt zwangslaeufig einen
+    # vollstaendigen 'balance'-Schnappschuss (manche Buchungstypen liefern
+    # dort vermutlich ein leeres/fehlendes Feld). Wird chronologisch einfach
+    # die LETZTE Buchung des Tages genommen, kann das zufaellig eine ohne
+    # Saldo sein, obwohl eine fruehere Buchung desselben Tages einen echten
+    # Saldo hatte - das ergab beobachtet einen rekonstruierten Saldo von
+    # exakt 0.00 an Tagen mit echter Kontoaktivitaet. Deshalb: je Tag die
+    # letzte Buchung MIT einem nicht-leeren balance-Feld bevorzugen, nur bei
+    # komplettem Fehlen eine balance-lose Buchung als Fallback nehmen.
     by_day_last: dict[str, dict] = {}
     for m in sorted(movements, key=lambda m: str(m.get("date") or "")):
         d = str(m.get("date") or "")[:10]
-        if d:
+        if not d:
+            continue
+        balance = m.get("balance")
+        if isinstance(balance, dict) and balance:
+            by_day_last[d] = m
+        elif d not in by_day_last:
             by_day_last[d] = m
 
     cash_result: dict[str, float] = {}
+    empty_balance_days = 0
     for d, movement in sorted(by_day_last.items()):
         balance = movement.get("balance") or {}
+        if not balance:
+            empty_balance_days += 1
         day = date.fromisoformat(d)
         cash_result[d] = sum(_to_chf(ccy, amount, day) for ccy, amount in balance.items())
+    if empty_balance_days:
+        logger.info(
+            "cashMovements: %d von %d Tagen ohne balance-Feld in irgendeiner Buchung dieses Tages",
+            empty_balance_days, len(by_day_last),
+        )
 
     if cash_result and live_cash_chf is not None:
-        last_value = cash_result[max(cash_result)]
-        if last_value <= 0 or abs(last_value - live_cash_chf) > max(200.0, live_cash_chf * 0.5):
-            logger.warning(
-                "Cash-Historie wirkt unplausibel (rekonstruiert=%.2f, live=%.2f) - verwende flachen aktuellen Wert",
-                last_value, live_cash_chf,
+        last_day = max(cash_result)
+        shift = live_cash_chf - cash_result[last_day]
+        if abs(shift) > 1e-6:
+            logger.info(
+                "Cash-Historie kalibriert: rekonstruiert(%s)=%.2f, live=%.2f, Verschiebung=%.2f",
+                last_day, cash_result[last_day], live_cash_chf, shift,
             )
-            cash_result = {}
+            cash_result = {d: v + shift for d, v in cash_result.items()}
 
     if not cash_result:
         return {}, {}
@@ -966,6 +999,7 @@ def history_backfill():
             initial_price = price_series[min(price_series.keys())] if (usable and price_series) else fallback_price
 
             qty_running = 0.0
+            prev_qty = 0.0
             price_running = initial_price
             d = first_date
             while d <= date.today():
@@ -978,11 +1012,19 @@ def history_backfill():
                     # 5-fache vom letzten bekannten Kurs abweicht, ist praktisch
                     # immer ein Datenfehler (falsches Symbol, GBX/GBP-Verwechslung,
                     # Chart-Decoding) statt eine echte Kursbewegung - verwerfen.
-                    if price_running <= 0 or 0.2 <= (candidate / price_running) <= 5:
+                    # Ausnahme: direkt nach einer Phase mit 0 gehaltenen Stuecken
+                    # (Position komplett verkauft und spaeter neu gekauft) wird
+                    # IMMER frisch verankert - sonst kann ein waehrend der
+                    # Halte-Pause aufgetretener echter Kurssprung (Split, laengere
+                    # Erholung/Einbruch) faelschlich als Ausreisser verworfen
+                    # bleiben und den Kurs fuer die gesamte Historie nach dem
+                    # Wiedereinstieg dauerhaft auf dem alten Stand einfrieren.
+                    if prev_qty == 0 or price_running <= 0 or 0.2 <= (candidate / price_running) <= 5:
                         price_running = candidate
                 fx = fx_rate_on(fx_series, d, fallback=1.0)
                 value_chf = qty_running * price_running * fx
                 daily_value_chf[iso] = daily_value_chf.get(iso, 0.0) + value_chf
+                prev_qty = qty_running
                 d += timedelta(days=1)
 
             per_product_meta.append({
