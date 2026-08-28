@@ -171,11 +171,23 @@ Performance umschalten. Beide beruhen auf:
 G(t) = (Depotwert(t) − kumulierte Netto-Einzahlungen(t)) / kumulierte Netto-Einzahlungen(t)
 ```
 
-Kumulierte Netto-Einzahlungen sind die laufende Summe aller Kontobuchungen
-**ohne** `productId` (also Bank-Ein-/Auszahlungen) aus DEGIROs Kontoauszug –
-Buchungen **mit** `productId` (Handel, Dividenden, Zinsen auf eine Position)
-zählen bewusst nicht dazu. Zahlst du Geld ein und kaufst davon Aktien,
-steigt der Nenner sofort mit, der Zähler (Depotwert) aber erst durch
+Kumulierte Netto-Einzahlungen werden **nicht** durch Klassifizieren
+einzelner Kontobuchungen bestimmt (zwei Anläufe – über den Buchungstyp
+geraten, dann über das Fehlen einer `productId` – waren beide nachweislich
+falsch: manche Einzahlungen/Cash-Fund-Sweeps tragen offenbar ebenfalls eine
+`productId` und wurden dadurch fälschlich als Handel statt als Einzahlung
+gezählt, was die Kennzahl bei jeder so verpassten Einzahlung sprunghaft nach
+oben trieb). Stattdessen rein rechnerisch hergeleitet:
+
+```
+NettoEinzahlungen(t) = Cash-Saldo(t) − kumulierter Handels-Cashflow(t)
+```
+
+Der Handels-Cashflow kommt direkt aus der (bereits an anderer Stelle
+verwendeten) Transaktionshistorie, nicht aus den mehrdeutigen
+Kontobuchungen – dadurch spielt es keine Rolle mehr, wie DEGIRO eine
+einzelne Buchung intern kategorisiert. Zahlst du Geld ein und kaufst davon
+Aktien, steigt der Nenner sofort mit, der Zähler (Depotwert) aber erst durch
 tatsächliche Kursgewinne – eine Einzahlung erzeugt also keinen künstlichen
 Sprung nach oben, sondern höchstens eine kurze Verwässerung.
 
