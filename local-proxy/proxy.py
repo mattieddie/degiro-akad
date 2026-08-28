@@ -164,8 +164,20 @@ def get_latest_fx_rate(from_ccy: str, to_ccy: str) -> float:
 
 
 def detect_base_currency(client_details: dict) -> str:
+    """
+    "baseCurrency" ist DEGIROs tatsaechliche Konto-/Reporting-Waehrung - in
+    dieser Waehrung sind sowohl das "value"-Feld jeder Portfolio-Position
+    (siehe portfolio()) als auch alle "...InBaseCurrency"-Felder der
+    Transaktionshistorie bereits angegeben. "currency" ist dagegen offenbar
+    nur eine Kursanzeige-Praeferenz (bei diesem Konto z.B. "EUR", obwohl die
+    tatsaechliche Basiswaehrung CHF ist) und wurde vorher faelschlich zuerst
+    verwendet - das fuehrte zu einer doppelten (zu tiefen) Umrechnung bei
+    Positionswert, realisiertem G/V, Transaktionsgebuehren und
+    Netto-Einzahlungen, bestaetigt anhand des vom Nutzer separat
+    verifizierten tatsaechlichen Gesamtwerts.
+    """
     data = (client_details or {}).get("data", {})
-    return data.get("currency") or data.get("baseCurrency") or "EUR"
+    return data.get("baseCurrency") or data.get("currency") or "EUR"
 
 
 # --- Hilfsfunktionen: historische Kurse (DEGIRO vwd-Chart-API) --------------
@@ -565,6 +577,12 @@ def login():
         SESSION["user_token"] = user_token
         SESSION["base_currency"] = detect_base_currency(client_details)
         SESSION["logged_in_at"] = datetime.now().isoformat()
+        logger.info(
+            "client_details Waehrungsfelder: currency=%s baseCurrency=%s -> verwendet=%s",
+            client_details.get("data", {}).get("currency"),
+            client_details.get("data", {}).get("baseCurrency"),
+            SESSION["base_currency"],
+        )
         # Nur im RAM fuer die Dauer dieser Sitzung - nie auf Platte geschrieben.
         # Ueberschreibt bewusst nicht mit None, falls dieses Login-Formular
         # ohne Key abgeschickt wurde, aber vorher schon einer per Umgebungs-
@@ -681,11 +699,25 @@ def portfolio():
             size = _num(p.get("size"))
             price = _num(p.get("price"))
             avg_price = _num(p.get("breakEvenPrice")) or _num(p.get("averagePrice"))
-            value_native = p.get("value")
-            value_native = _num(value_native) if value_native is not None else size * price
 
             fx = get_latest_fx_rate(currency, TARGET_CURRENCY)
-            value_chf = value_native * fx
+            raw_value = p.get("value")
+            if raw_value is not None:
+                # DEGIROs eigenes "value"-Feld ist bereits in der Konto-
+                # Basiswaehrung (base_currency, siehe detect_base_currency())
+                # angegeben - NICHT in der Notierungswaehrung der Boerse
+                # (p["currency"], z.B. EUR fuer eine an einer EUR-Boerse
+                # gehandelte Position, waehrend die Basiswaehrung z.B. CHF
+                # ist). Nochmals ueber den Boersen-FX-Kurs umzurechnen wuerde
+                # diesen Wert ein zweites Mal (und damit zu tief) umrechnen -
+                # bestaetigt, weil das genau den vom Nutzer separat
+                # verifizierten Gesamtwert traf. Stattdessen nur ueber
+                # Basiswaehrung->CHF umrechnen (meist ein No-Op).
+                value_native = _num(raw_value)
+                value_chf = value_native * get_latest_fx_rate(base_currency, TARGET_CURRENCY)
+            else:
+                value_native = size * price
+                value_chf = value_native * fx
             avg_cost_chf = avg_price * fx
             # Unrealisierter G/V = Stueck * (aktueller Kurs - Einstandskurs), in Originalwaehrung,
             # dann nach CHF umgerechnet. (Vorher faelschlich das mehrdeutige "plBase"-Feld verwendet.)
@@ -742,17 +774,56 @@ def portfolio():
 @require_login
 def transactions():
     trading_api = SESSION["trading_api"]
+    base_currency = SESSION["base_currency"] or "EUR"
     days = int(request.args.get("days", 3650))
+    since_d = date.today() - timedelta(days=days)
     try:
         history = trading_api.get_transactions_history(
-            transaction_request=HistoryRequest(
-                from_date=date.today() - timedelta(days=days),
-                to_date=date.today(),
-            ),
+            transaction_request=HistoryRequest(from_date=since_d, to_date=date.today()),
             raw=False,
         )
         items = _json_safe(history.data if hasattr(history, "data") else history)
-        return jsonify({"fetchedAt": datetime.now().isoformat(), "transactions": items})
+
+        # DEGIROs "totalInBaseCurrency" ist der reine Handelswert ohne
+        # Gebuehren; "totalPlusAllFeesInBaseCurrency" enthaelt Kauf-/Verkaufs-
+        # gebuehren bereits (das ist auch die Zahl, die an anderer Stelle fuer
+        # realisiertes G/V und Netto-Einzahlungen verwendet wird - siehe
+        # closed_positions()). Gebuehr = Differenz der beiden, das
+        # funktioniert vorzeichenunabhaengig fuer Kauf UND Verkauf. Damit die
+        # hier angezeigten Transaktionen 1:1 mit der Gesamtperformance
+        # zusammenpassen, wird beides zusaetzlich nach CHF umgerechnet.
+        fx_series = get_fx_series(since_d, date.today(), base_currency, TARGET_CURRENCY)
+        for t in items:
+            d_str = str(t.get("date") or "")[:10]
+            try:
+                day = date.fromisoformat(d_str)
+            except ValueError:
+                day = date.today()
+            fx = fx_rate_on(fx_series, day, fallback=1.0)
+
+            total_base = t.get("totalInBaseCurrency")
+            total_incl_fees_base = t.get("totalPlusAllFeesInBaseCurrency")
+            if total_incl_fees_base is None:
+                total_incl_fees_base = total_base
+            fee_base = (
+                _num(total_base) - _num(total_incl_fees_base)
+                if total_base is not None and total_incl_fees_base is not None
+                else 0.0
+            )
+
+            t["feesBaseCurrency"] = round(fee_base, 4)
+            t["feesChf"] = round(fee_base * fx, 2)
+            t["totalChf"] = round(_num(total_base) * fx, 2) if total_base is not None else None
+            t["totalPlusFeesChf"] = (
+                round(_num(total_incl_fees_base) * fx, 2) if total_incl_fees_base is not None else None
+            )
+
+        return jsonify({
+            "fetchedAt": datetime.now().isoformat(),
+            "currency": TARGET_CURRENCY,
+            "baseCurrency": base_currency,
+            "transactions": items,
+        })
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler beim Abrufen der Transaktionen")
         return jsonify({"error": f"Fehler beim Abrufen der Transaktionen: {e}"}), 502
