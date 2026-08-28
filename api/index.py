@@ -1,26 +1,27 @@
 """
-Lokaler DEGIRO-Proxy + Web-App fuer das degiro-akad Dashboard.
+DEGIRO-Backend fuer das degiro-akad Dashboard - Vercel-Serverless-Variante.
 
-Laeuft NUR auf deinem eigenen Rechner (127.0.0.1). Liefert die Web-Oberflaeche
-(index.html/assets/*) direkt selbst mit aus und leitet API-Anfragen an DEGIRO
-(und an eine oeffentliche, kostenlose FX-API fuer Waehrungsumrechnung) weiter.
-Es wird NICHTS auf die Festplatte oder nach GitHub geschrieben - Login-Daten
-und DEGIRO-Antworten leben ausschliesslich im Arbeitsspeicher dieses
-Prozesses, solange er laeuft. Beendest du das Skript (Strg+C), ist alles weg.
+WICHTIG, anders als die lokale Variante (local-proxy/proxy.py): dieser Code
+laeuft NICHT nur auf deinem eigenen Rechner, sondern auf Vercels Servern.
+Deine DEGIRO-Zugangsdaten werden bei jeder Anmeldung an diese Funktion
+gesendet (verschluesselt per HTTPS) und dort kurz verarbeitet, um dich bei
+DEGIRO anzumelden - danach nie gespeichert. Was ueber eine Anmeldung hinaus
+serverseitig fuer die laufende Sitzung noetig ist (Session-ID, Konto-Nr.,
+Basiswaehrung - NICHT das Passwort), liegt zeitlich befristet in einem
+externen Key-Value-Store (Vercel KV / Upstash Redis), da einzelne
+Serverless-Aufrufe zustandslos sind und sich keinen In-Memory-Zustand
+zuverlaessig merken.
 
-Start:
-    pip install -r requirements.txt
-    python proxy.py
+Die ganze App (auch die statischen Seiten) ist zusaetzlich per HTTP-Basic-
+Auth geschuetzt (Umgebungsvariablen APP_USERNAME / APP_PASSWORD), damit nicht
+jeder mit der Vercel-URL deine Finanzdaten sehen kann.
 
-Dann im Browser oeffnen: http://127.0.0.1:8765/
-
-Optional:
-    python proxy.py --port 8765
+Fuer ein Setup, bei dem wirklich nichts deinen eigenen Rechner verlaesst,
+siehe stattdessen local-proxy/proxy.py.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ from datetime import date, datetime, timedelta
 from functools import wraps
 
 import requests
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 from degiro_connector.core.exceptions import DeGiroConnectionError
 from degiro_connector.quotecast.models.chart import ChartRequest, Interval
@@ -41,15 +42,20 @@ from degiro_connector.trading.models.account import (
     UpdateOption,
     UpdateRequest,
 )
+from degiro_connector.core.models.model_connection import ModelConnection
 from degiro_connector.trading.models.credentials import Credentials
 from degiro_connector.trading.models.transaction import HistoryRequest
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("degiro-proxy")
+logger = logging.getLogger("degiro-backend")
 
-app = Flask(__name__)
+STATIC_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+app = Flask(__name__, static_folder=None)
 
-# --- In-Memory-Session & Caches (nichts wird auf Platte persistiert) --------
+# --- Arbeitsbereich fuer die Dauer EINER Anfrage -----------------------------
+# Serverless-Aufrufe sind zustandslos: dieses Dict wird bei jeder Anfrage aus
+# dem externen KV-Store neu befuellt (siehe require_session), nie ueber
+# mehrere Anfragen hinweg wiederverwendet.
 SESSION: dict = {
     "trading_api": None,
     "int_account": None,
@@ -59,20 +65,73 @@ SESSION: dict = {
     "fmp_api_key": None,
 }
 
-# Nur fuer die Dauer des laufenden Prozesses im RAM - kein Zugriff auf Disk.
+# Caches sind reine Performance-Optimierung innerhalb einer warmen Instanz -
+# duerfen jederzeit verloren gehen, ohne dass etwas kaputtgeht.
 FX_SERIES_CACHE: dict[tuple, dict[str, float]] = {}
 CHART_CACHE: dict[tuple, dict] = {}
 
 TARGET_CURRENCY = "CHF"
 
 # Optionale dritte Kursquelle (nach DEGIRO und Yahoo). Wird NUR aus der
-# Umgebungsvariable gelesen - der Key wird hier absichtlich nie hartcodiert
-# oder sonst irgendwo abgelegt. Setze ihn vor dem Start selbst, z.B.:
-#   PowerShell:  $env:FMP_API_KEY = "dein-key"; python proxy.py
-#   bash:        FMP_API_KEY=dein-key python proxy.py
+# Umgebungsvariable gelesen - hier nie hartcodiert. In Vercel unter
+# Project Settings -> Environment Variables setzen.
 FMP_API_KEY = os.environ.get("FMP_API_KEY")
 
+# Passwortschutz fuer die gesamte App (nicht zu verwechseln mit dem
+# DEGIRO-Login!). Beide Variablen muessen in Vercel gesetzt sein, sonst
+# bleibt die App absichtlich fuer niemanden erreichbar (fail-closed).
+APP_USERNAME = os.environ.get("APP_USERNAME")
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
+
+# DEGIRO-Sitzungsdaten (keine Passwoerter!) leben befristet in einem externen
+# KV-Store, adressiert ueber ein zufaelliges Cookie. Unterstuetzt sowohl die
+# "Vercel KV"- als auch die rohe Upstash-Namenskonvention der Umgebungs-
+# variablen, je nachdem wie die Integration in Vercel eingerichtet wurde.
+KV_URL = os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL")
+KV_TOKEN = os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+SESSION_COOKIE = "degiro_session"
+SESSION_TTL_SECONDS = 60 * 60 * 4  # 4h - grosszuegig, aber nicht unbegrenzt
+
 ALLOWED_ORIGINS: list[str] = []
+
+
+# --- KV-Store (Vercel KV / Upstash Redis REST API) --------------------------
+# Verwendet die dokumentierte Upstash-REST-Schnittstelle direkt per HTTP
+# (kein Redis-Client noetig, passt gut zu Serverless): POST an die KV_URL mit
+# einem JSON-Array ["BEFEHL", arg1, arg2, ...] im Body.
+# https://upstash.com/docs/redis/features/restapi
+
+def kv_available() -> bool:
+    return bool(KV_URL and KV_TOKEN)
+
+
+def _kv_command(*command_parts) -> object:
+    resp = requests.post(
+        KV_URL,
+        headers={"Authorization": f"Bearer {KV_TOKEN}"},
+        json=list(command_parts),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json().get("result")
+
+
+def kv_set_json(key: str, value: dict, ttl_seconds: int) -> None:
+    _kv_command("SET", key, json.dumps(value), "EX", ttl_seconds)
+
+
+def kv_get_json(key: str) -> dict | None:
+    raw = _kv_command("GET", key)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def kv_delete(key: str) -> None:
+    _kv_command("DEL", key)
 
 
 # --- Hilfsfunktionen: DEGIRO-Rohformat -------------------------------------
@@ -473,28 +532,88 @@ def resolve_price_series(
     return {}, "none", False, currency
 
 
-# --- Auth-Decorators ---------------------------------------------------------
-# Gleiches Cookie-Sitzungsmodell wie das Vercel-Backend (api/index.py), nur
-# dass die Sitzung hier in einem einfachen In-Memory-Dict liegt statt einem
-# externen KV-Store - unproblematisch, weil dieser Prozess (anders als eine
-# Vercel-Funktion) durchgehend als EIN langlebiger Prozess laeuft. Kein
-# separates Proxy-Token mehr noetig: der Proxy ist ohnehin nur ueber
-# 127.0.0.1 erreichbar, also nur von diesem einen Rechner aus.
+# --- App-weiter Passwortschutz (HTTP Basic Auth) -----------------------------
+# Getrennt vom DEGIRO-Login: schuetzt die gesamte App (auch die statischen
+# Seiten), damit nicht jeder mit der Vercel-URL deine Finanzdaten sehen kann.
 
-SESSION_STORE: dict[str, dict] = {}
-SESSION_COOKIE = "degiro_session"
-SESSION_MAX_AGE = 60 * 60 * 12
+def _check_basic_auth() -> bool:
+    if not APP_USERNAME or not APP_PASSWORD:
+        return False
+    auth = request.authorization
+    if not auth or auth.username is None or auth.password is None:
+        return False
+    return secrets.compare_digest(auth.username, APP_USERNAME) and secrets.compare_digest(auth.password, APP_PASSWORD)
+
+
+@app.before_request
+def enforce_app_password():
+    if request.method == "OPTIONS":
+        return None
+    if not _check_basic_auth():
+        message = "Zugriff verweigert. APP_USERNAME/APP_PASSWORD in Vercel gesetzt?"
+        headers = {"WWW-Authenticate": 'Basic realm="degiro-akad"'}
+        # Fuer /api/*-Aufrufe (vom Frontend per fetch() konsumiert) JSON liefern,
+        # damit proxyFetch() den echten Grund anzeigen kann statt der
+        # generischen "Proxy-Fehler (HTTP 401)"-Fallback-Meldung. Fuer normale
+        # Seitenaufrufe reicht Klartext, der WWW-Authenticate-Header loest so
+        # oder so den nativen Browser-Login-Dialog aus.
+        if request.path.startswith("/api/"):
+            resp = jsonify({"error": message})
+            resp.status_code = 401
+            resp.headers.update(headers)
+            return resp
+        return Response(message, 401, headers)
+    return None
+
+
+# --- DEGIRO-Sitzung: Wiederherstellung aus dem KV-Store ----------------------
+
+def _build_trading_api_from_stored_session(stored: dict) -> TradingAPI:
+    """
+    Baut ein funktionierendes TradingAPI-Objekt aus einer zuvor gespeicherten
+    DEGIRO-Session-ID neu auf, OHNE erneut Benutzername/Passwort zu senden.
+    Moeglich, weil degiro-connector Verbindungszustand (connection_storage)
+    und Zugangsdaten (credentials) als getrennte, injizierbare Objekte
+    modelliert: ModelConnection.session_id ist ein einfacher String-Setter,
+    der `connect()` nicht erneut aufrufen muss.
+    """
+    credentials = Credentials(
+        username=stored.get("username") or "session",
+        password="session-resumed",  # Platzhalter - wird nach dem Wiederherstellen nicht mehr gebraucht
+        int_account=stored.get("int_account"),
+    )
+    connection_storage = ModelConnection(timeout=TradingAPI.TRADING_TIMEOUT)
+    connection_storage.session_id = stored["degiro_session_id"]
+    return TradingAPI(credentials=credentials, connection_storage=connection_storage)
 
 
 def require_auth(fn):
+    """
+    Loest die serverseitige DEGIRO-Sitzung ueber das Session-Cookie aus dem
+    externen KV-Store auf und befuellt SESSION fuer die Dauer dieser Anfrage
+    (Serverless-Aufrufe sind zustandslos, daher kein Verlass auf einen
+    In-Memory-Zustand aus einer frueheren Anfrage). Der App-Passwortschutz
+    laeuft davon unabhaengig bereits ueber enforce_app_password().
+    """
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        session_id = request.cookies.get(SESSION_COOKIE, "")
-        stored = SESSION_STORE.get(session_id)
-        SESSION.update(stored or {
+        SESSION.update({
             "trading_api": None, "int_account": None, "user_token": None,
             "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
         })
+        session_id = request.cookies.get(SESSION_COOKIE)
+        if session_id and kv_available():
+            stored = kv_get_json(f"degiro_session:{session_id}")
+            if stored:
+                try:
+                    SESSION["trading_api"] = _build_trading_api_from_stored_session(stored)
+                    SESSION["int_account"] = stored.get("int_account")
+                    SESSION["user_token"] = stored.get("user_token")
+                    SESSION["base_currency"] = stored.get("base_currency")
+                    SESSION["logged_in_at"] = stored.get("logged_in_at")
+                    SESSION["fmp_api_key"] = stored.get("fmp_api_key")
+                except Exception:  # noqa: BLE001
+                    logger.exception("Sitzung konnte nicht aus dem KV-Store wiederhergestellt werden")
         return fn(*args, **kwargs)
 
     return wrapper
@@ -527,23 +646,6 @@ def options_handler(_any):
     return ("", 204)
 
 
-# --- Statische Seiten (index.html, assets/*) --------------------------------
-# Damit du die App direkt unter http://127.0.0.1:8765/ oeffnen kannst (kein
-# GitHub Pages noetig) - dasselbe Frontend wie beim Vercel-Deployment.
-
-STATIC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-@app.route("/", methods=["GET"])
-def serve_index():
-    return send_from_directory(STATIC_ROOT, "index.html")
-
-
-@app.route("/assets/<path:filename>", methods=["GET"])
-def serve_assets(filename):
-    return send_from_directory(os.path.join(STATIC_ROOT, "assets"), filename)
-
-
 # --- Endpunkte: Verbindung ---------------------------------------------------
 
 @app.route("/api/health", methods=["GET"])
@@ -556,11 +658,18 @@ def health():
         "baseCurrency": SESSION["base_currency"],
         "targetCurrency": TARGET_CURRENCY,
         "fmpConfigured": bool(get_fmp_api_key()),
+        "kvConfigured": kv_available(),
     })
 
 
 @app.route("/api/login", methods=["POST"])
 def login():
+    if not kv_available():
+        return jsonify({
+            "error": "Kein KV-Store konfiguriert (KV_REST_API_URL/KV_REST_API_TOKEN fehlen) - "
+                     "ohne den kann die Sitzung nicht ueber mehrere Anfragen hinweg bestehen bleiben."
+        }), 500
+
     body = request.get_json(silent=True) or {}
     username = body.get("username")
     password = body.get("password")
@@ -585,26 +694,36 @@ def login():
         int_account = client_details["data"]["intAccount"]
         user_token = client_details["data"]["id"]
         trading_api.credentials.int_account = int_account
-
         base_currency = detect_base_currency(client_details)
+        logged_in_at = datetime.now().isoformat()
+
+        # Nur diese wenigen, unkritischen Werte landen im KV-Store - NIE das
+        # Passwort. degiro_session_id erlaubt es, spaeter (siehe
+        # _build_trading_api_from_stored_session) ohne erneuten Login
+        # weiterzuarbeiten.
         session_id = secrets.token_urlsafe(32)
-        SESSION_STORE[session_id] = {
-            "trading_api": trading_api,
-            "int_account": int_account,
-            "user_token": user_token,
-            "base_currency": base_currency,
-            "logged_in_at": datetime.now().isoformat(),
-            "fmp_api_key": fmp_api_key,
-        }
+        kv_set_json(
+            f"degiro_session:{session_id}",
+            {
+                "degiro_session_id": trading_api.connection_storage.session_id,
+                "int_account": int_account,
+                "user_token": user_token,
+                "base_currency": base_currency,
+                "username": username,
+                "logged_in_at": logged_in_at,
+                "fmp_api_key": fmp_api_key,
+            },
+            SESSION_TTL_SECONDS,
+        )
 
         logger.info("Login erfolgreich (int_account=%s, base_currency=%s)", int_account, base_currency)
         response = jsonify({"success": True, "baseCurrency": base_currency})
         response.set_cookie(
             SESSION_COOKIE,
             session_id,
-            max_age=SESSION_MAX_AGE,
+            max_age=SESSION_TTL_SECONDS,
             httponly=True,
-            secure=False,  # laeuft nur auf http://127.0.0.1, kein HTTPS lokal
+            secure=True,
             samesite="Lax",
         )
         return response
@@ -616,7 +735,7 @@ def login():
         return jsonify({"error": f"Unerwarteter Fehler: {e}"}), 500
 
 
-def _connect_with_in_app_wait(trading_api: TradingAPI, max_wait_seconds: int = 90) -> None:
+def _connect_with_in_app_wait(trading_api: TradingAPI, max_wait_seconds: int = 45) -> None:
     """Verbindet sich; falls DEGIRO eine Bestaetigung in der App verlangt,
     wird bis zu max_wait_seconds gewartet (du musst dann in der DEGIRO-App bestaetigen)."""
     try:
@@ -649,8 +768,9 @@ def logout():
             trading_api.logout()
         except Exception:  # noqa: BLE001
             pass
-    session_id = request.cookies.get(SESSION_COOKIE, "")
-    SESSION_STORE.pop(session_id, None)
+    session_id = request.cookies.get(SESSION_COOKIE)
+    if session_id and kv_available():
+        kv_delete(f"degiro_session:{session_id}")
     SESSION.update({
         "trading_api": None, "int_account": None, "user_token": None,
         "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
@@ -1247,34 +1367,44 @@ def closed_positions():
         return jsonify({"error": f"Fehler beim Abrufen der geschlossenen Positionen: {e}"}), 502
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Lokaler DEGIRO-Proxy fuer das degiro-akad Dashboard")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument(
-        "--origin",
-        action="append",
-        default=None,
-        help="Erlaubter Origin der Webseite (mehrfach angebbar). Standard: https://mattieddie.github.io",
-    )
-    args = parser.parse_args()
+# --- Statische Seiten (index.html, assets/*) --------------------------------
+# Werden bewusst aus DIESER Funktion heraus ausgeliefert (nicht separat ueber
+# Vercels statisches Hosting), damit der App-Passwortschutz (Basic Auth oben)
+# auch fuer die Seiten selbst gilt - sonst koennte jeder die statischen
+# Dateien ansehen, nur eben ohne funktionierende API-Aufrufe dahinter.
 
-    global ALLOWED_ORIGINS
-    ALLOWED_ORIGINS = args.origin or [
-        "https://mattieddie.github.io",
+@app.route("/", methods=["GET"])
+def serve_index():
+    return send_from_directory(STATIC_ROOT, "index.html")
+
+
+@app.route("/assets/<path:filename>", methods=["GET"])
+def serve_assets(filename):
+    return send_from_directory(os.path.join(STATIC_ROOT, "assets"), filename)
+
+
+# --- Herkunft(en), von denen aus die API angesprochen werden darf -----------
+# Auf Vercel laufen Frontend und API i.d.R. same-origin (siehe oben), CORS
+# greift also normalerweise gar nicht. ALLOWED_ORIGIN kann in den Vercel-
+# Projekteinstellungen zusaetzlich gesetzt werden, falls die Seite doch von
+# woanders (z.B. lokal zum Testen) aus angesprochen werden soll.
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in (os.environ.get("ALLOWED_ORIGIN", "").split(",") + [
+        f"https://{os.environ.get('VERCEL_URL')}" if os.environ.get("VERCEL_URL") else "",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
-    ]
+    ])
+    if origin.strip()
+]
 
-    print("=" * 70)
-    print(" DEGIRO-Proxy laeuft lokal. Nichts wird gespeichert oder an GitHub gesendet.")
-    print(" Waehrungsumrechnung nach CHF via api.frankfurter.app (oeffentliche EZB-Kurse).")
-    print(f" Kursquellen: DEGIRO, Yahoo Finance, Financial Modeling Prep ({'aktiv' if FMP_API_KEY else 'kein FMP_API_KEY gesetzt - uebersprungen'})")
-    print(f" Oeffne im Browser: http://127.0.0.1:{args.port}/")
-    print(" Beenden mit Strg+C")
-    print("=" * 70)
-
-    app.run(host="127.0.0.1", port=args.port, debug=False)
-
-
-if __name__ == "__main__":
-    main()
+if not APP_USERNAME or not APP_PASSWORD:
+    logger.warning(
+        "APP_USERNAME/APP_PASSWORD sind nicht gesetzt - die App bleibt bis dahin "
+        "fuer niemanden erreichbar (fail-closed), siehe enforce_app_password()."
+    )
+if not kv_available():
+    logger.warning(
+        "Kein KV-Store konfiguriert (KV_REST_API_URL/KV_REST_API_TOKEN bzw. "
+        "UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN fehlen) - Login wird fehlschlagen."
+    )
