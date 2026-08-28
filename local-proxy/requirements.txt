@@ -1,2 +1,4 @@
 degiro-connector>=3.0.35
 flask>=3.0.0
+polars>=1.0.0
+requests>=2.32.5

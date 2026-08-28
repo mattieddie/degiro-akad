@@ -49,15 +49,15 @@
 
   <section id="panel-summary" class="cards hidden">
     <div class="card stat">
-      <span class="stat-label">Gesamtwert (Equity)</span>
+      <span class="stat-label">Gesamtwert (Equity, CHF)</span>
       <span id="stat-equity" class="stat-value">–</span>
     </div>
     <div class="card stat">
-      <span class="stat-label">Cash</span>
+      <span class="stat-label">Verfügbar (Available to Trade, CHF)</span>
       <span id="stat-cash" class="stat-value">–</span>
     </div>
     <div class="card stat">
-      <span class="stat-label">Positionswert</span>
+      <span class="stat-label">Positionswert (CHF)</span>
       <span id="stat-positions" class="stat-value">–</span>
     </div>
     <div class="card stat">
@@ -67,17 +67,31 @@
   </section>
 
   <section id="panel-chart" class="card hidden">
-    <h2>Performance über Zeit</h2>
+    <div class="chart-header">
+      <h2>Performance über Zeit (CHF)</h2>
+      <div id="range-buttons" class="range-buttons">
+        <button data-range="1D" class="range-btn">1T</button>
+        <button data-range="1W" class="range-btn">1W</button>
+        <button data-range="1M" class="range-btn">1M</button>
+        <button data-range="3M" class="range-btn">3M</button>
+        <button data-range="6M" class="range-btn">6M</button>
+        <button data-range="1Y" class="range-btn">1J</button>
+        <button data-range="YTD" class="range-btn">YTD</button>
+        <button data-range="MAX" class="range-btn active">Max</button>
+      </div>
+    </div>
     <p class="hint">
-      Der Verlauf wird lokal in deinem Browser aufgebaut: jedes Mal, wenn du diese Seite mit
-      laufendem Proxy öffnest, wird ein Datenpunkt für den heutigen Tag hinzugefügt.
-      Es gibt keine rückwirkende Historie von DEGIRO.
+      Seit-Kauf-Verlauf wird aus deiner Transaktionshistorie und DEGIRO-Kurscharts rekonstruiert
+      (Näherung, siehe Hinweis unten) und danach lokal mit echten Tages-Schnappschüssen ergänzt,
+      sobald du die Seite mit laufendem Proxy öffnest.
     </p>
+    <p id="history-note" class="hint"></p>
     <canvas id="chart-history" height="90"></canvas>
   </section>
 
   <section id="panel-positions" class="card hidden">
     <h2>Positionen</h2>
+    <p class="hint">Klick auf eine Zeile für Kursverlauf &amp; Details.</p>
     <div class="table-wrap">
       <table id="table-positions">
         <thead>
@@ -86,10 +100,10 @@
             <th>Symbol</th>
             <th>Stück</th>
             <th>Kurs</th>
-            <th>Wert</th>
+            <th>Wert (CHF)</th>
             <th>Anteil</th>
             <th>Ø Einstand</th>
-            <th>Unreal. G/V</th>
+            <th>Unreal. G/V (CHF)</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -120,6 +134,24 @@
 <footer>
   <p>Inoffizielles, privates Dashboard auf Basis von <code>degiro-connector</code>. Keine Verbindung zu DEGIRO N.V. Keine Anlageberatung.</p>
 </footer>
+
+<div id="modal-overlay" class="modal-overlay hidden">
+  <div class="modal">
+    <button id="modal-close" class="modal-close" aria-label="Schließen">×</button>
+    <h2 id="modal-title">–</h2>
+    <p id="modal-subtitle" class="hint">–</p>
+    <p id="modal-verify-note" class="hint"></p>
+    <canvas id="modal-chart" height="80"></canvas>
+    <div class="modal-stats">
+      <div><span class="stat-label">ISIN</span><span id="modal-isin" class="stat-value small">–</span></div>
+      <div><span class="stat-label">Stück</span><span id="modal-size" class="stat-value small">–</span></div>
+      <div><span class="stat-label">Kurs</span><span id="modal-price" class="stat-value small">–</span></div>
+      <div><span class="stat-label">Wert (CHF)</span><span id="modal-value" class="stat-value small">–</span></div>
+      <div><span class="stat-label">Ø Einstand</span><span id="modal-avg" class="stat-value small">–</span></div>
+      <div><span class="stat-label">Unreal. G/V (CHF)</span><span id="modal-pl" class="stat-value small">–</span></div>
+    </div>
+  </div>
+</div>
 
 <script src="assets/app.js"></script>
 </body>

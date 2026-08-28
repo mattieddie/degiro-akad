@@ -69,14 +69,51 @@ Klick auf **„Verbinden & Daten laden“**.
 Im Repo unter *Settings → Pages*: Source = `Deploy from a branch`, Branch =
 `main` / `/ (root)`.
 
+## Alle Beträge in CHF
+
+Der Proxy rechnet alle Geldbeträge (Kurse, Werte, Cash, G/V) automatisch in
+Schweizer Franken um, via [api.frankfurter.app](https://www.frankfurter.app/)
+(kostenlose, öffentliche EZB-Wechselkurse). Es wird jeweils der Kurs des
+entsprechenden Tages verwendet – auch für die historische Rekonstruktion.
+
+## Cash / „Available to Trade“
+
+Die Kennzahl „Verfügbar“ stammt aus DEGIROs `CASH_FUNDS`-Block (dein
+tatsächliches, freies Barguthaben), nicht aus den mehrdeutigen internen
+Report-Feldern des Gesamtportfolios.
+
+## Unrealisierte Gewinne/Verluste
+
+Wird pro Position exakt berechnet als `Stück × (aktueller Kurs − Ø
+Einstandskurs)`, in der Originalwährung, danach nach CHF umgerechnet.
+
 ## Performance-Graph
 
-DEGIRO liefert keine fertige historische Wertentwicklung über die API. Der
-Graph wird deshalb **lokal in deinem Browser aufgebaut**: Jedes Mal, wenn du
-die Seite mit laufendem Proxy öffnest bzw. „Aktualisieren“ klickst, wird ein
-Datenpunkt (Datum, Gesamtwert, Cash) für den heutigen Tag gespeichert. Je
-regelmässiger du die Seite öffnest, desto aussagekräftiger wird der Verlauf.
-Es gibt keine rückwirkende Historie.
+Der Graph kombiniert zwei Quellen:
+
+1. **Seit-Kauf-Rekonstruktion** (`/api/history/backfill`): Der Proxy
+   berechnet beim Verbinden aus deiner kompletten Transaktionshistorie plus
+   DEGIROs Kurscharts einen Best-Effort-Verlauf zurück bis zu deinem ersten
+   Kauf. Da das Kurschart-Rohformat von DEGIRO nicht offiziell dokumentiert
+   ist, wird jede Kursserie automatisch gegen den separat gemeldeten
+   Schlusskurs geprüft. Nur **verifizierte** Positionen fliessen mit echtem
+   Kursverlauf ein; bei nicht verifizierten wird ein Näherungswert (letzter
+   bekannter Kurs, flach) verwendet – die Seite zeigt dir unter dem Graphen
+   an, wie viele Positionen betroffen sind.
+2. **Lokale Tages-Schnappschüsse**: Zusätzlich wird bei jedem Öffnen der
+   Seite mit laufendem Proxy ein exakter Datenpunkt für den heutigen Tag
+   gespeichert (localStorage). Für bereits erfasste Tage überschreibt dieser
+   exakte Wert die Näherung aus der Rekonstruktion.
+
+Wählbare Zeiträume (1T/1W/1M/3M/6M/1J/YTD/Max) filtern diese kombinierte
+Serie clientseitig. Da nur Tageswerte (kein Intraday) erfasst werden, zeigt
+„1T“ entsprechend wenig Auflösung.
+
+## Positions-Detailansicht
+
+Klick auf eine Position öffnet ein Popup mit Kursverlauf (gleiche
+Verifizierungslogik wie oben) sowie ISIN, Stückzahl, Kurs, Wert und
+unrealisiertem G/V.
 
 ## Sicherheits- und Risikohinweise
 
@@ -94,6 +131,13 @@ Es gibt keine rückwirkende Historie.
 - **Proxy-Bindung**: `proxy.py` bindet ausschliesslich an `127.0.0.1`
   (nicht ans Netzwerk erreichbar) und verlangt für jede Anfrage das beim
   Start ausgegebene Token.
+- **Externe FX-API**: Für die CHF-Umrechnung kontaktiert der Proxy
+  `api.frankfurter.app`. Dabei werden ausschliesslich Währungscodes und
+  Datumswerte übertragen – keine Konto- oder Portfoliodaten.
+- **Historische Kursdaten**: Die Seit-Kauf-Rekonstruktion nutzt DEGIROs
+  nicht offiziell dokumentiertes Kurschart-Format mit automatischer
+  Plausibilitätsprüfung (siehe oben). Bitte die „nicht verifiziert“-Hinweise
+  auf der Seite ernst nehmen.
 - Dies ist **keine Anlageberatung** und keine offizielle DEGIRO-Anwendung.
 
 ## Lokale Daten löschen
