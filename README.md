@@ -98,15 +98,24 @@ Der Graph kombiniert zwei Quellen:
    jede Kursserie automatisch gegen den separat gemeldeten Schlusskurs
    geprüft:
    - **`degiro` (verifiziert)**: DEGIROs eigenes Kurschart, Prüfung erfolgreich.
-   - **`yahoo`**: DEGIROs Chart war nicht abrufbar oder nicht verifizierbar –
-     die Kursdaten werden stattdessen von der öffentlichen, unauthentifizierten
-     Chart-API von Yahoo Finance bezogen (Symbol wird über die ISIN aufgelöst,
-     kein Raten von Börsenkürzeln nötig).
-   - **`none`**: Weder DEGIRO noch Yahoo lieferten brauchbare Daten – es wird
-     ein Näherungswert (letzter bekannter Kurs, flach) verwendet.
+   - **`yahoo` (verifiziert)**: DEGIROs Chart war nicht abrufbar oder nicht
+     verifizierbar – die Kursdaten wurden stattdessen von der öffentlichen,
+     unauthentifizierten Chart-API von Yahoo Finance bezogen (Symbol wird
+     über die ISIN aufgelöst) **und** erfolgreich gegen DEGIROs gemeldeten
+     Schlusskurs geprüft.
+   - **nicht verwendet**: Weder DEGIRO noch Yahoo lieferten Daten, die zum
+     von DEGIRO gemeldeten Schlusskurs passen (z.B. weil Yahoo mangels
+     ISIN-Treffer ein falsches Instrument zurückgab) – in diesem Fall wird
+     **nichts Ungeprüftes verwendet**, sondern ein Näherungswert (letzter
+     bekannter Kurs, flach). Ein einzelner nicht passender Datenpunkt ist
+     damit nie die Ursache für einen falschen Ausschlag im Graphen.
+
+   Zusätzlich wird die rekonstruierte Cash-Historie gegen den tatsächlichen,
+   live abgefragten Cash-Stand geprüft und bei starker Abweichung verworfen
+   (flache Linie mit dem echten aktuellen Wert statt einer falschen Kurve).
 
    Die Seite zeigt dir unter dem Graphen und im Positions-Popup an, welche
-   Quelle jeweils verwendet wurde.
+   Quelle jeweils tatsächlich verwendet wurde.
 2. **Lokale Tages-Schnappschüsse**: Zusätzlich wird bei jedem Öffnen der
    Seite mit laufendem Proxy ein exakter Datenpunkt für den heutigen Tag
    gespeichert (localStorage). Für bereits erfasste Tage überschreibt dieser
@@ -125,8 +134,8 @@ mitten im gewählten Zeitraum zeigt sich also mit als „Performance“.
 ## Positions-Detailansicht
 
 Klick auf eine Position öffnet ein Popup mit Kursverlauf (gleiche
-Verifizierungslogik wie oben) sowie ISIN, Stückzahl, Kurs, Wert und
-unrealisiertem G/V.
+Verifizierungslogik wie oben, ebenfalls mit Kurs/Performance(%)-Umschalter)
+sowie ISIN, Stückzahl, Kurs, Wert und unrealisiertem G/V (CHF und %).
 
 ## Sicherheits- und Risikohinweise
 

@@ -619,10 +619,15 @@ def transactions():
 
 # --- Endpunkte: Historie (seit Kauf, in CHF) ---------------------------------
 
-def _get_cash_history_chf(trading_api, base_currency: str, since_d: date) -> dict[str, float]:
+def _get_cash_history_chf(trading_api, since_d: date, live_cash_chf: float | None) -> dict[str, float]:
     """
     Exakte taegliche Cash-Historie aus DEGIROs eigenen 'cashMovements' (inkl.
-    laufendem Saldo je Buchung), nach CHF umgerechnet und vorwaertsgefuellt.
+    laufendem Saldo je Buchung), nach CHF umgerechnet. Wird zusaetzlich gegen
+    den live abgefragten aktuellen Cash-Stand geprueft: weicht der letzte
+    rekonstruierte Wert stark davon ab, ist das 'balance'-Format vermutlich
+    nicht so wie angenommen (nicht offiziell dokumentiert) - dann lieber
+    leer zurueckgeben (Aufrufer faellt auf eine flache, korrekte Linie
+    zurueck), statt eine falsche Kurve zu zeigen.
     """
     try:
         overview = trading_api.get_account_overview(
@@ -637,12 +642,17 @@ def _get_cash_history_chf(trading_api, base_currency: str, since_d: date) -> dic
     if not movements:
         return {}
 
+    # Nicht auf die von der API gelieferte Reihenfolge verlassen - explizit
+    # chronologisch sortieren, damit "letzter Eintrag pro Tag" wirklich der
+    # spaeteste ist (manche Endpunkte liefern neueste zuerst).
+    movements_sorted = sorted(movements, key=lambda m: str(m.get("date") or ""))
+
     by_day_last: dict[str, dict] = {}
-    for m in movements:
+    for m in movements_sorted:
         d = str(m.get("date") or "")[:10]
         if not d:
             continue
-        by_day_last[d] = m  # Liste ist idR chronologisch; letzter Eintrag pro Tag gewinnt
+        by_day_last[d] = m
 
     fx_cache_series: dict[str, dict[str, float]] = {}
     result: dict[str, float] = {}
@@ -651,10 +661,23 @@ def _get_cash_history_chf(trading_api, base_currency: str, since_d: date) -> dic
         day = date.fromisoformat(d)
         total_chf = 0.0
         for ccy, amount in balance.items():
+            if not isinstance(ccy, str) or len(ccy) != 3 or not ccy.isalpha():
+                continue  # unerwarteter Schluessel im balance-dict - nicht blind als Waehrung behandeln
+            ccy = ccy.upper()
             if ccy not in fx_cache_series:
                 fx_cache_series[ccy] = get_fx_series(since_d, date.today(), ccy, TARGET_CURRENCY)
             total_chf += _num(amount) * fx_rate_on(fx_cache_series[ccy], day, fallback=1.0)
         result[d] = total_chf
+
+    if result and live_cash_chf is not None:
+        last_value = result[max(result)]
+        if last_value <= 0 or abs(last_value - live_cash_chf) > max(200.0, live_cash_chf * 0.5):
+            logger.warning(
+                "Cash-Historie wirkt unplausibel (rekonstruiert=%.2f, live=%.2f) - verwende flachen aktuellen Wert",
+                last_value, live_cash_chf,
+            )
+            return {}
+
     return result
 
 
@@ -702,7 +725,10 @@ def history_backfill():
         earliest = min(date.fromisoformat(str(t.get("date"))[:10]) for t in tx_items)
 
         account_update = trading_api.get_update(
-            request_list=[UpdateRequest(option=UpdateOption.PORTFOLIO, last_updated=0)],
+            request_list=[
+                UpdateRequest(option=UpdateOption.PORTFOLIO, last_updated=0),
+                UpdateRequest(option=UpdateOption.CASH_FUNDS, last_updated=0),
+            ],
             raw=True,
         )
         current_positions = _flatten_rows((account_update.get("portfolio") or {}).get("value") or [])
@@ -712,7 +738,14 @@ def history_backfill():
         info_raw = trading_api.get_products_info(product_list=product_ids, raw=True) if product_ids else {}
         product_info = (info_raw or {}).get("data", {})
 
-        cash_series = _get_cash_history_chf(trading_api, base_currency, earliest)
+        live_cash_amount, live_cash_ccy = _get_cash_available_to_trade(account_update)
+        live_cash_chf = live_cash_amount * get_latest_fx_rate(live_cash_ccy, TARGET_CURRENCY)
+
+        cash_series = _get_cash_history_chf(trading_api, earliest, live_cash_chf)
+        if not cash_series:
+            # Rekonstruktion nicht verfuegbar/unplausibel - flache Linie mit dem
+            # tatsaechlichen aktuellen Cash-Stand ist ehrlicher als eine falsche Kurve.
+            cash_series = {earliest.isoformat(): live_cash_chf, date.today().isoformat(): live_cash_chf}
 
         per_product_meta = []
         daily_value_chf: dict[str, float] = {}
@@ -737,7 +770,11 @@ def history_backfill():
                 SESSION["user_token"], vwd_id, info.get("isin"), info.get("symbol"), currency,
                 info.get("closePrice"), str(info.get("closePriceDate") or "")[:10], first_date,
             )
-            usable = source == "yahoo" or (source == "degiro" and verified)
+            # Nur verifizierte Daten verwenden - egal ob Quelle DEGIRO oder Yahoo.
+            # Ein unverifizierter Yahoo-Treffer kann (z.B. bei Symbol-Kollisionen
+            # nach fehlgeschlagener ISIN-Suche) ein voellig falsches Instrument
+            # sein, nicht nur eine leicht abweichende Kursnotierung.
+            usable = verified
 
             fx_series = get_fx_series(first_date, date.today(), series_currency, TARGET_CURRENCY)
             fallback_price = _num(info.get("closePrice")) or 0.0
@@ -750,7 +787,13 @@ def history_backfill():
                 if iso in qty_by_day:
                     qty_running = qty_by_day[iso]
                 if usable and iso in price_series:
-                    price_running = price_series[iso]
+                    candidate = price_series[iso]
+                    # Ausreisser-Schutz: ein einzelner Tag, der um mehr als das
+                    # 5-fache vom letzten bekannten Kurs abweicht, ist praktisch
+                    # immer ein Datenfehler (falsches Symbol, GBX/GBP-Verwechslung,
+                    # Chart-Decoding) statt eine echte Kursbewegung - verwerfen.
+                    if price_running <= 0 or 0.2 <= (candidate / price_running) <= 5:
+                        price_running = candidate
                 fx = fx_rate_on(fx_series, d, fallback=1.0)
                 value_chf = qty_running * price_running * fx
                 daily_value_chf[iso] = daily_value_chf.get(iso, 0.0) + value_chf
@@ -761,6 +804,7 @@ def history_backfill():
                 "name": info.get("name"),
                 "source": source,
                 "verified": verified,
+                "used": usable,
                 "since": first_date.isoformat(),
             })
 
@@ -785,7 +829,7 @@ def history_backfill():
             "since": earliest.isoformat(),
             "series": series,
             "positions": per_product_meta,
-            "note": "source=degiro: DEGIRO-Kurschart (verifiziert). source=yahoo: Kursdaten von Yahoo Finance bezogen, da DEGIROs Chart nicht abrufbar/verifizierbar war. source=none: kein Kursverlauf gefunden, es wird ein Naeherungswert (letzter bekannter Kurs) verwendet.",
+            "note": "used=true: echter Kursverlauf verwendet (source=degiro: DEGIRO-Kurschart; source=yahoo: DEGIRO nicht verifizierbar, Yahoo Finance stattdessen erfolgreich verifiziert). used=false: kein verifizierter Kursverlauf gefunden, es wird ein Naeherungswert (letzter bekannter Kurs, flach) verwendet.",
         })
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler bei der Historien-Rekonstruktion")
@@ -818,7 +862,11 @@ def position_history():
             SESSION["user_token"], vwd_id, info.get("isin"), info.get("symbol"), currency,
             info.get("closePrice"), str(info.get("closePriceDate") or "")[:10], first_date,
         )
-        usable = source == "yahoo" or (source == "degiro" and verified)
+        # Nur verifizierte Daten verwenden - egal ob Quelle DEGIRO oder Yahoo.
+        # Ein unverifizierter Yahoo-Treffer kann (z.B. bei Symbol-Kollisionen
+        # nach fehlgeschlagener ISIN-Suche) ein voellig falsches Instrument
+        # sein, nicht nur eine leicht abweichende Kursnotierung.
+        usable = verified
         if not usable:
             price_series = {}
 
@@ -829,12 +877,18 @@ def position_history():
             fx = fx_rate_on(fx_series, d, fallback=1.0)
             series.append({"date": d_str, "priceNative": price, "priceChf": round(price * fx, 4)})
 
-        notes = {
-            "degiro": "Kursverlauf von DEGIRO, gegen den gemeldeten Schlusskurs validiert.",
-            "yahoo": "DEGIROs Kurschart war nicht verfuegbar/verifizierbar - Kursdaten stattdessen von Yahoo Finance bezogen"
-                     + ("." if verified else " (auch dort nicht exakt gegen DEGIRO validierbar, kleine Abweichungen moeglich)."),
-            "none": "Kein historischer Kursverlauf gefunden (weder DEGIRO noch Yahoo Finance). Ab heute wird lokal exakt weitergefuehrt.",
-        }
+        if usable:
+            notes = {
+                "degiro": "Kursverlauf von DEGIRO, gegen den gemeldeten Schlusskurs validiert.",
+                "yahoo": "DEGIROs Kurschart war nicht verfuegbar/verifizierbar - Kursdaten stattdessen von Yahoo Finance bezogen und erfolgreich validiert.",
+            }
+            note = notes[source]
+        else:
+            note = (
+                "Kein verifizierter Kursverlauf gefunden (weder DEGIRO noch Yahoo Finance lieferten Daten, "
+                "die zum von DEGIRO gemeldeten Schlusskurs passen) - es wird kein historischer Kurs angezeigt. "
+                "Ab heute wird lokal exakt weitergefuehrt."
+            )
 
         return jsonify({
             "productId": product_id,
@@ -846,9 +900,10 @@ def position_history():
             "currency": series_currency,
             "source": source,
             "verified": verified,
+            "used": usable,
             "since": first_date.isoformat(),
             "series": series,
-            "note": notes[source],
+            "note": note,
         })
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler beim Abrufen der Positions-Historie")

@@ -198,13 +198,13 @@ function currentMergedHistory() {
 
 function buildHistoryNoteText(positions) {
   if (!positions || !positions.length) return "";
-  const degiroVerified = positions.filter((p) => p.source === "degiro" && p.verified).length;
-  const yahoo = positions.filter((p) => p.source === "yahoo").length;
-  const none = positions.filter((p) => p.source === "none" || !p.source).length;
+  const degiro = positions.filter((p) => p.used && p.source === "degiro").length;
+  const yahoo = positions.filter((p) => p.used && p.source === "yahoo").length;
+  const none = positions.filter((p) => !p.used).length;
   const parts = [];
-  if (degiroVerified) parts.push(`${degiroVerified} von DEGIRO validiert`);
-  if (yahoo) parts.push(`${yahoo} über Yahoo Finance (DEGIRO nicht verifizierbar)`);
-  if (none) parts.push(`${none} ohne Kursverlauf (Näherung, letzter bekannter Kurs)`);
+  if (degiro) parts.push(`${degiro} mit echtem Verlauf von DEGIRO`);
+  if (yahoo) parts.push(`${yahoo} mit echtem Verlauf von Yahoo Finance (DEGIRO nicht verifizierbar)`);
+  if (none) parts.push(`${none} ohne verifizierten Kursverlauf (Näherung, letzter bekannter Kurs, flach)`);
   return `Kursquellen: ${parts.join(", ")}.`;
 }
 
@@ -314,24 +314,49 @@ function mergePositionSeries(backendSeries, organic) {
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
+let modalSeries = [];
+let modalMode = "value";
+
 function renderModalChart(series, currency) {
+  modalSeries = series;
   const ctx = el("modal-chart").getContext("2d");
   if (modalChart) modalChart.destroy();
-  modalChart = new Chart(ctx, {
-    type: "line",
-    data: {
-      labels: series.map((s) => s.date),
-      datasets: [{
+
+  if (modalMode === "percent") {
+    const basePoint = series.find((s) => s.priceNative !== null && s.priceNative !== undefined && s.priceNative !== 0);
+    const base = basePoint ? basePoint.priceNative : null;
+    const pct = series.map((s) => (base && s.priceNative !== null && s.priceNative !== undefined ? ((s.priceNative / base) - 1) * 100 : null));
+    modalChart = new Chart(ctx, {
+      type: "line",
+      data: { labels: series.map((s) => s.date), datasets: [{
+        label: "Performance (%) seit Kauf",
+        data: pct, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,0.15)",
+        tension: 0.2, fill: true, pointRadius: series.length > 90 ? 0 : 2,
+      }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: (v) => v.toFixed(1) + "%" } } } },
+    });
+  } else {
+    modalChart = new Chart(ctx, {
+      type: "line",
+      data: { labels: series.map((s) => s.date), datasets: [{
         label: `Kurs (${currency || "native"})`,
         data: series.map((s) => s.priceNative),
-        borderColor: "#4f8cff",
-        backgroundColor: "rgba(79,140,255,0.15)",
-        tension: 0.2,
-        fill: true,
-        pointRadius: series.length > 90 ? 0 : 2,
-      }],
-    },
-    options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: false } } },
+        borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,0.15)",
+        tension: 0.2, fill: true, pointRadius: series.length > 90 ? 0 : 2,
+      }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: false } } },
+    });
+  }
+}
+
+function setModalModeButtons(currency) {
+  document.querySelectorAll("#modal-mode-buttons .range-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.mode === modalMode);
+    btn.onclick = () => {
+      modalMode = btn.dataset.mode;
+      setModalModeButtons(currency);
+      renderModalChart(modalSeries, currency);
+    };
   });
 }
 
@@ -339,6 +364,7 @@ function openModal() { el("modal-overlay").classList.remove("hidden"); }
 function closeModal() { el("modal-overlay").classList.add("hidden"); }
 
 async function openPositionModal(position) {
+  modalMode = "value";
   el("modal-title").textContent = position.name || position.productId;
   el("modal-subtitle").textContent = `${position.symbol || ""} · ${position.currency || ""} · ${position.productType || ""}`;
   el("modal-isin").textContent = position.isin || "–";
@@ -346,8 +372,10 @@ async function openPositionModal(position) {
   el("modal-price").textContent = fmtNative(position.price, position.currency);
   el("modal-value").textContent = fmtChf(position.valueChf);
   el("modal-avg").textContent = fmtNative(position.averagePrice, position.currency);
-  el("modal-pl").textContent = position.plUnrealizedChf !== null && position.plUnrealizedChf !== undefined ? fmtChf(position.plUnrealizedChf) : "–";
+  const plPctTxt = position.plUnrealizedPct !== null && position.plUnrealizedPct !== undefined ? ` (${position.plUnrealizedPct.toFixed(1)}%)` : "";
+  el("modal-pl").textContent = position.plUnrealizedChf !== null && position.plUnrealizedChf !== undefined ? fmtChf(position.plUnrealizedChf) + plPctTxt : "–";
   el("modal-verify-note").textContent = "Lade Kursverlauf...";
+  setModalModeButtons(position.currency);
   openModal();
 
   const today = new Date().toISOString().slice(0, 10);
