@@ -163,6 +163,9 @@ th { color: var(--text-muted); font-weight: 500; }
   padding: 1rem;
   z-index: 50;
 }
+.modal-overlay.hidden {
+  display: none;
+}
 .modal {
   position: relative;
   background: var(--bg-card);
