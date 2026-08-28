@@ -218,13 +218,127 @@ def fetch_daily_close_series(user_token: int, vwd_id: str, since_d: date) -> dic
     return series_map
 
 
-def verify_series(series_map: dict[str, float], reference_price: float | None, reference_date: str | None) -> bool:
+def verify_series(
+    series_map: dict[str, float],
+    reference_price: float | None,
+    reference_date: str | None,
+    tolerance_pct: float = 0.01,
+) -> bool:
     if not series_map or reference_price is None or not reference_date:
         return False
     got = series_map.get(reference_date)
     if got is None:
         return False
-    return abs(got - reference_price) <= max(0.01, reference_price * 0.01)
+    return abs(got - reference_price) <= max(0.01, reference_price * tolerance_pct)
+
+
+# --- Hilfsfunktionen: historische Kurse, Fallback (Yahoo Finance) -----------
+# Wird nur verwendet, wenn DEGIROs eigenes Kurschart nicht abrufbar ist oder
+# sich nicht gegen den von DEGIRO gemeldeten Schlusskurs verifizieren laesst.
+# Aufloesung ueber die ISIN (eindeutig, kein Rateversuch bei Boersenkuerzeln
+# noetig) via Yahoo's oeffentliche, unauthentifizierte Such- und Chart-Endpunkte.
+
+YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; degiro-akad-dashboard)"}
+
+
+def yahoo_resolve_symbol(isin: str | None, fallback_symbol: str | None) -> str | None:
+    if isin:
+        try:
+            resp = requests.get(
+                "https://query2.finance.yahoo.com/v1/finance/search",
+                params={"q": isin, "quotesCount": 5, "newsCount": 0},
+                headers=YAHOO_HEADERS,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            quotes = resp.json().get("quotes") or []
+            if quotes and quotes[0].get("symbol"):
+                return quotes[0]["symbol"]
+        except Exception:  # noqa: BLE001
+            logger.warning("Yahoo-ISIN-Suche fuer %s fehlgeschlagen", isin, exc_info=True)
+    return fallback_symbol
+
+
+def fetch_yahoo_daily_close_series(isin: str | None, fallback_symbol: str | None, since_d: date) -> tuple[dict[str, float], str | None]:
+    """Liefert (Serie {ISO-Datum: Schlusskurs}, Waehrung laut Yahoo) oder ({}, None)."""
+    symbol = yahoo_resolve_symbol(isin, fallback_symbol)
+    if not symbol:
+        return {}, None
+
+    cache_key = ("yahoo", symbol, since_d.isoformat())
+    if cache_key in CHART_CACHE:
+        return CHART_CACHE[cache_key]
+
+    years_back = max(1, (date.today() - since_d).days // 365 + 1)
+    range_param = "10y" if years_back > 5 else ("5y" if years_back > 2 else "2y")
+
+    series_map: dict[str, float] = {}
+    currency = None
+    try:
+        resp = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+            params={"range": range_param, "interval": "1d"},
+            headers=YAHOO_HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        result = ((resp.json() or {}).get("chart") or {}).get("result") or []
+        if result:
+            r0 = result[0]
+            timestamps = r0.get("timestamp") or []
+            quote = ((r0.get("indicators") or {}).get("quote") or [{}])[0]
+            closes = quote.get("close") or []
+            currency = (r0.get("meta") or {}).get("currency")
+            for ts, c in zip(timestamps, closes):
+                if c is None:
+                    continue
+                d = datetime.utcfromtimestamp(ts).date()
+                if d >= since_d:
+                    series_map[d.isoformat()] = float(c)
+    except Exception:  # noqa: BLE001
+        logger.warning("Yahoo-Chart fuer Symbol=%s nicht abrufbar", symbol, exc_info=True)
+        series_map = {}
+
+    result_tuple = (series_map, currency)
+    CHART_CACHE[cache_key] = result_tuple
+    return result_tuple
+
+
+def resolve_price_series(
+    user_token: int,
+    vwd_id: str | None,
+    isin: str | None,
+    symbol: str | None,
+    currency: str,
+    close_price: float | None,
+    close_price_date: str | None,
+    since_d: date,
+) -> tuple[dict[str, float], str, bool, str]:
+    """
+    Liefert (Serie, Quelle, verifiziert, Waehrung_der_Serie). Reihenfolge:
+    1. DEGIRO-Kurschart, falls gegen DEGIROs eigenen Schlusskurs verifizierbar.
+    2. Yahoo Finance (oeffentlich, ueber ISIN aufgeloest), falls DEGIRO nicht
+       verifizierbar ist - mit etwas grosszuegigerer Toleranz, da
+       unterschiedliche Datenanbieter leicht abweichende Schlusskurse melden
+       koennen.
+    3. Letzter unverifizierter DEGIRO-Versuch, falls vorhanden.
+    4. Nichts gefunden.
+    """
+    degiro_series: dict[str, float] = {}
+    if vwd_id:
+        degiro_series = fetch_daily_close_series(user_token, vwd_id, since_d)
+        if verify_series(degiro_series, close_price, close_price_date):
+            return degiro_series, "degiro", True, currency
+
+    yahoo_series, yahoo_ccy = fetch_yahoo_daily_close_series(isin, symbol, since_d)
+    if yahoo_series:
+        yahoo_verified = verify_series(yahoo_series, close_price, close_price_date, tolerance_pct=0.03)
+        return yahoo_series, "yahoo", yahoo_verified, (yahoo_ccy or currency)
+
+    if degiro_series:
+        return degiro_series, "degiro", False, currency
+
+    return {}, "none", False, currency
 
 
 # --- Auth-Decorators ---------------------------------------------------------
@@ -619,13 +733,13 @@ def history_backfill():
                 running += signed_qty
                 qty_by_day[d] = running
 
-            verified = False
-            price_series: dict[str, float] = {}
-            if vwd_id:
-                price_series = fetch_daily_close_series(SESSION["user_token"], vwd_id, first_date)
-                verified = verify_series(price_series, info.get("closePrice"), str(info.get("closePriceDate") or "")[:10])
+            price_series, source, verified, series_currency = resolve_price_series(
+                SESSION["user_token"], vwd_id, info.get("isin"), info.get("symbol"), currency,
+                info.get("closePrice"), str(info.get("closePriceDate") or "")[:10], first_date,
+            )
+            usable = source == "yahoo" or (source == "degiro" and verified)
 
-            fx_series = get_fx_series(first_date, date.today(), currency, TARGET_CURRENCY)
+            fx_series = get_fx_series(first_date, date.today(), series_currency, TARGET_CURRENCY)
             fallback_price = _num(info.get("closePrice")) or 0.0
 
             qty_running = 0.0
@@ -635,7 +749,7 @@ def history_backfill():
                 iso = d.isoformat()
                 if iso in qty_by_day:
                     qty_running = qty_by_day[iso]
-                if verified and iso in price_series:
+                if usable and iso in price_series:
                     price_running = price_series[iso]
                 fx = fx_rate_on(fx_series, d, fallback=1.0)
                 value_chf = qty_running * price_running * fx
@@ -645,6 +759,7 @@ def history_backfill():
             per_product_meta.append({
                 "productId": pid,
                 "name": info.get("name"),
+                "source": source,
                 "verified": verified,
                 "since": first_date.isoformat(),
             })
@@ -670,7 +785,7 @@ def history_backfill():
             "since": earliest.isoformat(),
             "series": series,
             "positions": per_product_meta,
-            "note": "Positionen ohne 'verified': Kursverlauf konnte nicht gegen DEGIRO validiert werden, es wird ein Naeherungswert (letzter bekannter Kurs) verwendet.",
+            "note": "source=degiro: DEGIRO-Kurschart (verifiziert). source=yahoo: Kursdaten von Yahoo Finance bezogen, da DEGIROs Chart nicht abrufbar/verifizierbar war. source=none: kein Kursverlauf gefunden, es wird ein Naeherungswert (letzter bekannter Kurs) verwendet.",
         })
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler bei der Historien-Rekonstruktion")
@@ -699,18 +814,27 @@ def position_history():
         tx_items = [t for t in ((tx_history or {}).get("data") or []) if str(t.get("productId")) == str(product_id)]
         first_date = min((date.fromisoformat(str(t.get("date"))[:10]) for t in tx_items), default=date.today() - timedelta(days=365))
 
-        verified = False
-        price_series = {}
-        if vwd_id:
-            price_series = fetch_daily_close_series(SESSION["user_token"], vwd_id, first_date)
-            verified = verify_series(price_series, info.get("closePrice"), str(info.get("closePriceDate") or "")[:10])
+        price_series, source, verified, series_currency = resolve_price_series(
+            SESSION["user_token"], vwd_id, info.get("isin"), info.get("symbol"), currency,
+            info.get("closePrice"), str(info.get("closePriceDate") or "")[:10], first_date,
+        )
+        usable = source == "yahoo" or (source == "degiro" and verified)
+        if not usable:
+            price_series = {}
 
-        fx_series = get_fx_series(first_date, date.today(), currency, TARGET_CURRENCY)
+        fx_series = get_fx_series(first_date, date.today(), series_currency, TARGET_CURRENCY)
         series = []
         for d_str, price in sorted(price_series.items()):
             d = date.fromisoformat(d_str)
             fx = fx_rate_on(fx_series, d, fallback=1.0)
             series.append({"date": d_str, "priceNative": price, "priceChf": round(price * fx, 4)})
+
+        notes = {
+            "degiro": "Kursverlauf von DEGIRO, gegen den gemeldeten Schlusskurs validiert.",
+            "yahoo": "DEGIROs Kurschart war nicht verfuegbar/verifizierbar - Kursdaten stattdessen von Yahoo Finance bezogen"
+                     + ("." if verified else " (auch dort nicht exakt gegen DEGIRO validierbar, kleine Abweichungen moeglich)."),
+            "none": "Kein historischer Kursverlauf gefunden (weder DEGIRO noch Yahoo Finance). Ab heute wird lokal exakt weitergefuehrt.",
+        }
 
         return jsonify({
             "productId": product_id,
@@ -719,11 +843,12 @@ def position_history():
             "isin": info.get("isin"),
             "exchangeId": info.get("exchangeId"),
             "productType": info.get("productType"),
-            "currency": currency,
+            "currency": series_currency,
+            "source": source,
             "verified": verified,
             "since": first_date.isoformat(),
             "series": series,
-            "note": None if verified else "Kursverlauf konnte nicht gegen DEGIRO validiert werden - ggf. unvollstaendig oder falsch skaliert.",
+            "note": notes[source],
         })
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler beim Abrufen der Positions-Historie")

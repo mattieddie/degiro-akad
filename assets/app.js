@@ -34,6 +34,7 @@ const el = (id) => document.getElementById(id);
 
 let lastPositions = [];
 let currentRange = "MAX";
+let currentMode = "value";
 let historyChart = null;
 let modalChart = null;
 
@@ -151,31 +152,80 @@ function renderChart(fullSeries) {
   const series = filterByRange(fullSeries, currentRange);
   const ctx = el("chart-history").getContext("2d");
   const labels = series.map((h) => h.date);
-  const equity = series.map((h) => h.equity);
-  const cash = series.map((h) => h.cash);
 
   if (historyChart) historyChart.destroy();
-  historyChart = new Chart(ctx, {
-    type: "line",
-    data: {
-      labels,
-      datasets: [
-        { label: "Gesamtwert (CHF)", data: equity, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,0.15)", tension: 0.2, fill: true, pointRadius: series.length > 90 ? 0 : 2 },
-        { label: "Cash / Available to Trade (CHF)", data: cash, borderColor: "#35c98f", backgroundColor: "transparent", borderDash: [4, 3], tension: 0.2, pointRadius: 0 },
-      ],
-    },
-    options: { responsive: true, plugins: { legend: { position: "bottom" } }, scales: { y: { beginAtZero: false } } },
-  });
+
+  if (currentMode === "percent") {
+    el("chart-title").textContent = "Performance seit Range-Start (%)";
+    const basePoint = series.find((h) => h.equity !== null && h.equity !== undefined && h.equity !== 0);
+    const base = basePoint ? basePoint.equity : null;
+    const pct = series.map((h) => (base && h.equity !== null && h.equity !== undefined ? ((h.equity / base) - 1) * 100 : null));
+    historyChart = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels,
+        datasets: [
+          { label: "Performance (%)", data: pct, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,0.15)", tension: 0.2, fill: true, pointRadius: series.length > 90 ? 0 : 2 },
+        ],
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { position: "bottom" } },
+        scales: { y: { ticks: { callback: (v) => v.toFixed(1) + "%" } } },
+      },
+    });
+  } else {
+    el("chart-title").textContent = "Performance über Zeit (CHF)";
+    const equity = series.map((h) => h.equity);
+    const cash = series.map((h) => h.cash);
+    historyChart = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels,
+        datasets: [
+          { label: "Gesamtwert (CHF)", data: equity, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,0.15)", tension: 0.2, fill: true, pointRadius: series.length > 90 ? 0 : 2 },
+          { label: "Cash / Available to Trade (CHF)", data: cash, borderColor: "#35c98f", backgroundColor: "transparent", borderDash: [4, 3], tension: 0.2, pointRadius: 0 },
+        ],
+      },
+      options: { responsive: true, plugins: { legend: { position: "bottom" } }, scales: { y: { beginAtZero: false } } },
+    });
+  }
+}
+
+function currentMergedHistory() {
+  return mergeHistorySeries(loadLocal(LS_KEYS.historyBackfill, {}).series, loadLocal(LS_KEYS.history, []));
+}
+
+function buildHistoryNoteText(positions) {
+  if (!positions || !positions.length) return "";
+  const degiroVerified = positions.filter((p) => p.source === "degiro" && p.verified).length;
+  const yahoo = positions.filter((p) => p.source === "yahoo").length;
+  const none = positions.filter((p) => p.source === "none" || !p.source).length;
+  const parts = [];
+  if (degiroVerified) parts.push(`${degiroVerified} von DEGIRO validiert`);
+  if (yahoo) parts.push(`${yahoo} über Yahoo Finance (DEGIRO nicht verifizierbar)`);
+  if (none) parts.push(`${none} ohne Kursverlauf (Näherung, letzter bekannter Kurs)`);
+  return `Kursquellen: ${parts.join(", ")}.`;
 }
 
 function setRangeButtons() {
-  document.querySelectorAll(".range-btn").forEach((btn) => {
+  document.querySelectorAll("#range-buttons .range-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.range === currentRange);
     btn.onclick = () => {
       currentRange = btn.dataset.range;
       setRangeButtons();
-      const merged = mergeHistorySeries(loadLocal(LS_KEYS.historyBackfill, {}).series, loadLocal(LS_KEYS.history, []));
-      renderChart(merged);
+      renderChart(currentMergedHistory());
+    };
+  });
+}
+
+function setModeButtons() {
+  document.querySelectorAll("#mode-buttons .range-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.mode === currentMode);
+    btn.onclick = () => {
+      currentMode = btn.dataset.mode;
+      setModeButtons();
+      renderChart(currentMergedHistory());
     };
   });
 }
@@ -309,9 +359,7 @@ async function openPositionModal(position) {
     const data = await proxyFetch(`/api/position-history?productId=${encodeURIComponent(position.productId)}`);
     const merged = mergePositionSeries(data.series, organic);
     renderModalChart(merged, position.currency);
-    el("modal-verify-note").textContent = data.verified
-      ? "Kursverlauf gegen DEGIRO validiert."
-      : (data.note || "Kursverlauf konnte nicht validiert werden - ggf. unvollständig/ungenau. Ab heute wird er lokal exakt weitergeführt.");
+    el("modal-verify-note").textContent = data.note || "";
   } catch (err) {
     renderModalChart(organic, position.currency);
     el("modal-verify-note").textContent = "Historischer Verlauf nicht verfügbar (Proxy nicht erreichbar?). Zeige nur lokal erfasste Werte: " + err.message;
@@ -338,12 +386,10 @@ function renderAllFromCache() {
   const merged = mergeHistorySeries(backfill.series, organic);
   if (merged.length) {
     setRangeButtons();
+    setModeButtons();
     renderChart(merged);
     if (backfill.positions) {
-      const unverified = backfill.positions.filter((p) => !p.verified).length;
-      el("history-note").textContent = unverified
-        ? `Hinweis: bei ${unverified} von ${backfill.positions.length} Position(en) konnte der historische Kursverlauf nicht gegen DEGIRO validiert werden (Näherung, letzter bekannter Kurs).`
-        : "Kursverlauf aller Positionen gegen DEGIRO validiert.";
+      el("history-note").textContent = buildHistoryNoteText(backfill.positions);
     }
   }
 }
@@ -410,16 +456,14 @@ async function refreshData() {
   // Backfill ist rechenintensiv (Kurscharts + FX) - im Hintergrund laden,
   // damit Portfolio/Positionen sofort sichtbar sind.
   setRangeButtons();
+  setModeButtons();
   renderChart(mergeHistorySeries(loadLocal(LS_KEYS.historyBackfill, {}).series, organic));
   proxyFetch("/api/history/backfill")
     .then((backfill) => {
       saveLocal(LS_KEYS.historyBackfill, backfill);
       renderChart(mergeHistorySeries(backfill.series, organic));
       if (backfill.positions) {
-        const unverified = backfill.positions.filter((p) => !p.verified).length;
-        el("history-note").textContent = unverified
-          ? `Hinweis: bei ${unverified} von ${backfill.positions.length} Position(en) konnte der historische Kursverlauf nicht gegen DEGIRO validiert werden (Näherung, letzter bekannter Kurs).`
-          : "Kursverlauf aller Positionen gegen DEGIRO validiert.";
+        el("history-note").textContent = buildHistoryNoteText(backfill.positions);
       }
     })
     .catch((err) => {

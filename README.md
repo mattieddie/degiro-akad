@@ -93,13 +93,20 @@ Der Graph kombiniert zwei Quellen:
 
 1. **Seit-Kauf-Rekonstruktion** (`/api/history/backfill`): Der Proxy
    berechnet beim Verbinden aus deiner kompletten Transaktionshistorie plus
-   DEGIROs Kurscharts einen Best-Effort-Verlauf zurück bis zu deinem ersten
-   Kauf. Da das Kurschart-Rohformat von DEGIRO nicht offiziell dokumentiert
-   ist, wird jede Kursserie automatisch gegen den separat gemeldeten
-   Schlusskurs geprüft. Nur **verifizierte** Positionen fliessen mit echtem
-   Kursverlauf ein; bei nicht verifizierten wird ein Näherungswert (letzter
-   bekannter Kurs, flach) verwendet – die Seite zeigt dir unter dem Graphen
-   an, wie viele Positionen betroffen sind.
+   Kurscharts einen Best-Effort-Verlauf zurück bis zu deinem ersten Kauf.
+   Da DEGIROs Kurschart-Rohformat nicht offiziell dokumentiert ist, wird
+   jede Kursserie automatisch gegen den separat gemeldeten Schlusskurs
+   geprüft:
+   - **`degiro` (verifiziert)**: DEGIROs eigenes Kurschart, Prüfung erfolgreich.
+   - **`yahoo`**: DEGIROs Chart war nicht abrufbar oder nicht verifizierbar –
+     die Kursdaten werden stattdessen von der öffentlichen, unauthentifizierten
+     Chart-API von Yahoo Finance bezogen (Symbol wird über die ISIN aufgelöst,
+     kein Raten von Börsenkürzeln nötig).
+   - **`none`**: Weder DEGIRO noch Yahoo lieferten brauchbare Daten – es wird
+     ein Näherungswert (letzter bekannter Kurs, flach) verwendet.
+
+   Die Seite zeigt dir unter dem Graphen und im Positions-Popup an, welche
+   Quelle jeweils verwendet wurde.
 2. **Lokale Tages-Schnappschüsse**: Zusätzlich wird bei jedem Öffnen der
    Seite mit laufendem Proxy ein exakter Datenpunkt für den heutigen Tag
    gespeichert (localStorage). Für bereits erfasste Tage überschreibt dieser
@@ -108,6 +115,12 @@ Der Graph kombiniert zwei Quellen:
 Wählbare Zeiträume (1T/1W/1M/3M/6M/1J/YTD/Max) filtern diese kombinierte
 Serie clientseitig. Da nur Tageswerte (kein Intraday) erfasst werden, zeigt
 „1T“ entsprechend wenig Auflösung.
+
+Über die Buttons „Wert (CHF)“ / „Performance (%)“ lässt sich zwischen
+absoluter Wertdarstellung und der prozentualen Veränderung relativ zum
+ersten Tag im gewählten Zeitraum umschalten. Die %-Ansicht ist eine einfache
+Wertveränderung (nicht um Ein-/Auszahlungen bereinigt) – eine Einzahlung
+mitten im gewählten Zeitraum zeigt sich also mit als „Performance“.
 
 ## Positions-Detailansicht
 
@@ -136,8 +149,12 @@ unrealisiertem G/V.
   Datumswerte übertragen – keine Konto- oder Portfoliodaten.
 - **Historische Kursdaten**: Die Seit-Kauf-Rekonstruktion nutzt DEGIROs
   nicht offiziell dokumentiertes Kurschart-Format mit automatischer
-  Plausibilitätsprüfung (siehe oben). Bitte die „nicht verifiziert“-Hinweise
-  auf der Seite ernst nehmen.
+  Plausibilitätsprüfung (siehe oben). Bitte die Kursquellen-Hinweise auf der
+  Seite ernst nehmen.
+- **Yahoo-Finance-Fallback**: Wird nur kontaktiert, wenn DEGIROs Kurschart
+  nicht verfügbar/verifizierbar ist. Übertragen werden dabei ISIN bzw.
+  Symbol des jeweiligen Produkts (öffentliche Marktdaten-Endpunkte, keine
+  Authentifizierung, keine Konto- oder Login-Daten).
 - Dies ist **keine Anlageberatung** und keine offizielle DEGIRO-Anwendung.
 
 ## Lokale Daten löschen
