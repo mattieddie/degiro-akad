@@ -1,28 +1,24 @@
 """
-DEGIRO-Backend fuer das degiro-akad Dashboard - Vercel-Serverless-Variante.
+Lokaler DEGIRO-Proxy fuer das degiro-akad Dashboard.
 
-WICHTIG, anders als die lokale Variante (local-proxy/proxy.py): dieser Code
-laeuft NICHT nur auf deinem eigenen Rechner, sondern auf Vercels Servern.
-Deine DEGIRO-Zugangsdaten werden bei jeder Anmeldung an diese Funktion
-gesendet (verschluesselt per HTTPS) und dort kurz verarbeitet, um dich bei
-DEGIRO anzumelden - danach nie gespeichert. Was ueber eine Anmeldung hinaus
-serverseitig fuer die laufende Sitzung noetig ist (Session-ID, Konto-Nr.,
-Basiswaehrung - NICHT das Passwort), liegt zeitlich befristet in einem
-externen Key-Value-Store (Vercel KV / Upstash Redis), da einzelne
-Serverless-Aufrufe zustandslos sind und sich keinen In-Memory-Zustand
-zuverlaessig merken.
+Laeuft NUR auf deinem eigenen Rechner (127.0.0.1) und leitet Anfragen von der
+GitHub-Pages-Seite an DEGIRO (und an eine oeffentliche, kostenlose FX-API fuer
+Waehrungsumrechnung) weiter. Es wird NICHTS auf die Festplatte oder nach
+GitHub geschrieben - Login-Daten und DEGIRO-Antworten leben ausschliesslich
+im Arbeitsspeicher dieses Prozesses, solange er laeuft. Beendest du das
+Skript (Strg+C), ist alles weg.
 
-Die ganze App (auch die statischen Seiten) ist zusaetzlich per HTTP-Basic-
-Auth geschuetzt (Umgebungsvariablen APP_USERNAME / APP_PASSWORD), damit nicht
-jeder mit der Vercel-URL deine Finanzdaten sehen kann.
+Start:
+    pip install -r requirements.txt
+    python proxy.py
 
-Fuer ein Setup, bei dem wirklich nichts deinen eigenen Rechner verlaesst,
-siehe stattdessen local-proxy/proxy.py.
+Optional:
+    python proxy.py --port 8765 --origin https://mattieddie.github.io
 """
 
 from __future__ import annotations
 
-import json
+import argparse
 import logging
 import os
 import secrets
@@ -31,7 +27,7 @@ from datetime import date, datetime, timedelta
 from functools import wraps
 
 import requests
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 
 from degiro_connector.core.exceptions import DeGiroConnectionError
 from degiro_connector.quotecast.models.chart import ChartRequest, Interval
@@ -42,20 +38,15 @@ from degiro_connector.trading.models.account import (
     UpdateOption,
     UpdateRequest,
 )
-from degiro_connector.core.models.model_connection import ModelConnection
 from degiro_connector.trading.models.credentials import Credentials
 from degiro_connector.trading.models.transaction import HistoryRequest
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("degiro-backend")
+logger = logging.getLogger("degiro-proxy")
 
-STATIC_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-app = Flask(__name__, static_folder=None)
+app = Flask(__name__)
 
-# --- Arbeitsbereich fuer die Dauer EINER Anfrage -----------------------------
-# Serverless-Aufrufe sind zustandslos: dieses Dict wird bei jeder Anfrage aus
-# dem externen KV-Store neu befuellt (siehe require_session), nie ueber
-# mehrere Anfragen hinweg wiederverwendet.
+# --- In-Memory-Session & Caches (nichts wird auf Platte persistiert) --------
 SESSION: dict = {
     "trading_api": None,
     "int_account": None,
@@ -65,73 +56,26 @@ SESSION: dict = {
     "fmp_api_key": None,
 }
 
-# Caches sind reine Performance-Optimierung innerhalb einer warmen Instanz -
-# duerfen jederzeit verloren gehen, ohne dass etwas kaputtgeht.
+# Nur fuer die Dauer des laufenden Prozesses im RAM - kein Zugriff auf Disk.
 FX_SERIES_CACHE: dict[tuple, dict[str, float]] = {}
 CHART_CACHE: dict[tuple, dict] = {}
 
 TARGET_CURRENCY = "CHF"
 
 # Optionale dritte Kursquelle (nach DEGIRO und Yahoo). Wird NUR aus der
-# Umgebungsvariable gelesen - hier nie hartcodiert. In Vercel unter
-# Project Settings -> Environment Variables setzen.
+# Umgebungsvariable gelesen - der Key wird hier absichtlich nie hartcodiert
+# oder sonst irgendwo abgelegt. Setze ihn vor dem Start selbst, z.B.:
+#   PowerShell:  $env:FMP_API_KEY = "dein-key"; python proxy.py
+#   bash:        FMP_API_KEY=dein-key python proxy.py
 FMP_API_KEY = os.environ.get("FMP_API_KEY")
 
-# Passwortschutz fuer die gesamte App (nicht zu verwechseln mit dem
-# DEGIRO-Login!). Beide Variablen muessen in Vercel gesetzt sein, sonst
-# bleibt die App absichtlich fuer niemanden erreichbar (fail-closed).
-APP_USERNAME = os.environ.get("APP_USERNAME")
-APP_PASSWORD = os.environ.get("APP_PASSWORD")
-
-# DEGIRO-Sitzungsdaten (keine Passwoerter!) leben befristet in einem externen
-# KV-Store, adressiert ueber ein zufaelliges Cookie. Unterstuetzt sowohl die
-# "Vercel KV"- als auch die rohe Upstash-Namenskonvention der Umgebungs-
-# variablen, je nachdem wie die Integration in Vercel eingerichtet wurde.
-KV_URL = os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL")
-KV_TOKEN = os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+# Serverseitige Sitzungen bleiben nur im Speicher dieser laufenden Instanz.
+# Der Browser erhält ausschließlich eine HttpOnly-Cookie-ID, nie ein Backend-Token.
+SESSION_STORE: dict[str, dict] = {}
 SESSION_COOKIE = "degiro_session"
-SESSION_TTL_SECONDS = 60 * 60 * 4  # 4h - grosszuegig, aber nicht unbegrenzt
+SESSION_MAX_AGE = 60 * 60 * 12
 
 ALLOWED_ORIGINS: list[str] = []
-
-
-# --- KV-Store (Vercel KV / Upstash Redis REST API) --------------------------
-# Verwendet die dokumentierte Upstash-REST-Schnittstelle direkt per HTTP
-# (kein Redis-Client noetig, passt gut zu Serverless): POST an die KV_URL mit
-# einem JSON-Array ["BEFEHL", arg1, arg2, ...] im Body.
-# https://upstash.com/docs/redis/features/restapi
-
-def kv_available() -> bool:
-    return bool(KV_URL and KV_TOKEN)
-
-
-def _kv_command(*command_parts) -> object:
-    resp = requests.post(
-        KV_URL,
-        headers={"Authorization": f"Bearer {KV_TOKEN}"},
-        json=list(command_parts),
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json().get("result")
-
-
-def kv_set_json(key: str, value: dict, ttl_seconds: int) -> None:
-    _kv_command("SET", key, json.dumps(value), "EX", ttl_seconds)
-
-
-def kv_get_json(key: str) -> dict | None:
-    raw = _kv_command("GET", key)
-    if raw is None:
-        return None
-    try:
-        return json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def kv_delete(key: str) -> None:
-    _kv_command("DEL", key)
 
 
 # --- Hilfsfunktionen: DEGIRO-Rohformat -------------------------------------
@@ -532,80 +476,17 @@ def resolve_price_series(
     return {}, "none", False, currency
 
 
-# --- App-weiter Passwortschutz (HTTP Basic Auth) -----------------------------
-# Getrennt vom DEGIRO-Login: schuetzt die gesamte App (auch die statischen
-# Seiten), damit nicht jeder mit der Vercel-URL deine Finanzdaten sehen kann.
-
-def _check_basic_auth() -> bool:
-    if not APP_USERNAME or not APP_PASSWORD:
-        return False
-    auth = request.authorization
-    if not auth or auth.username is None or auth.password is None:
-        return False
-    return secrets.compare_digest(auth.username, APP_USERNAME) and secrets.compare_digest(auth.password, APP_PASSWORD)
-
-
-@app.before_request
-def enforce_app_password():
-    if request.method == "OPTIONS":
-        return None
-    if not _check_basic_auth():
-        return Response(
-            "Zugriff verweigert. APP_USERNAME/APP_PASSWORD in Vercel gesetzt?",
-            401,
-            {"WWW-Authenticate": 'Basic realm="degiro-akad"'},
-        )
-    return None
-
-
-# --- DEGIRO-Sitzung: Wiederherstellung aus dem KV-Store ----------------------
-
-def _build_trading_api_from_stored_session(stored: dict) -> TradingAPI:
-    """
-    Baut ein funktionierendes TradingAPI-Objekt aus einer zuvor gespeicherten
-    DEGIRO-Session-ID neu auf, OHNE erneut Benutzername/Passwort zu senden.
-    Moeglich, weil degiro-connector Verbindungszustand (connection_storage)
-    und Zugangsdaten (credentials) als getrennte, injizierbare Objekte
-    modelliert: ModelConnection.session_id ist ein einfacher String-Setter,
-    der `connect()` nicht erneut aufrufen muss.
-    """
-    credentials = Credentials(
-        username=stored.get("username") or "session",
-        password="session-resumed",  # Platzhalter - wird nach dem Wiederherstellen nicht mehr gebraucht
-        int_account=stored.get("int_account"),
-    )
-    connection_storage = ModelConnection(timeout=TradingAPI.TRADING_TIMEOUT)
-    connection_storage.session_id = stored["degiro_session_id"]
-    return TradingAPI(credentials=credentials, connection_storage=connection_storage)
-
+# --- Auth-Decorators ---------------------------------------------------------
 
 def require_auth(fn):
-    """
-    Loest die serverseitige DEGIRO-Sitzung ueber das Session-Cookie aus dem
-    externen KV-Store auf und befuellt SESSION fuer die Dauer dieser Anfrage
-    (Serverless-Aufrufe sind zustandslos, daher kein Verlass auf einen
-    In-Memory-Zustand aus einer frueheren Anfrage). Der App-Passwortschutz
-    laeuft davon unabhaengig bereits ueber enforce_app_password().
-    """
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        SESSION.update({
-            "trading_api": None, "int_account": None, "user_token": None,
-            "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
-        })
-        session_id = request.cookies.get(SESSION_COOKIE)
-        if session_id and kv_available():
-            stored = kv_get_json(f"degiro_session:{session_id}")
-            if stored:
-                try:
-                    SESSION["trading_api"] = _build_trading_api_from_stored_session(stored)
-                    SESSION["int_account"] = stored.get("int_account")
-                    SESSION["user_token"] = stored.get("user_token")
-                    SESSION["base_currency"] = stored.get("base_currency")
-                    SESSION["logged_in_at"] = stored.get("logged_in_at")
-                    SESSION["fmp_api_key"] = stored.get("fmp_api_key")
-                except Exception:  # noqa: BLE001
-                    logger.exception("Sitzung konnte nicht aus dem KV-Store wiederhergestellt werden")
+        session_id = request.cookies.get(SESSION_COOKIE, "")
+        session = SESSION_STORE.get(session_id)
+        if not session_id or session is None:
+            return jsonify({"error": "Backend-Sitzung fehlt oder ist abgelaufen"}), 401
+        SESSION.clear()
+        SESSION.update(session)
         return fn(*args, **kwargs)
 
     return wrapper
@@ -641,7 +522,6 @@ def options_handler(_any):
 # --- Endpunkte: Verbindung ---------------------------------------------------
 
 @app.route("/api/health", methods=["GET"])
-@require_auth
 def health():
     return jsonify({
         "status": "ok",
@@ -650,18 +530,11 @@ def health():
         "baseCurrency": SESSION["base_currency"],
         "targetCurrency": TARGET_CURRENCY,
         "fmpConfigured": bool(get_fmp_api_key()),
-        "kvConfigured": kv_available(),
     })
 
 
 @app.route("/api/login", methods=["POST"])
 def login():
-    if not kv_available():
-        return jsonify({
-            "error": "Kein KV-Store konfiguriert (KV_REST_API_URL/KV_REST_API_TOKEN fehlen) - "
-                     "ohne den kann die Sitzung nicht ueber mehrere Anfragen hinweg bestehen bleiben."
-        }), 500
-
     body = request.get_json(silent=True) or {}
     username = body.get("username")
     password = body.get("password")
@@ -686,34 +559,27 @@ def login():
         int_account = client_details["data"]["intAccount"]
         user_token = client_details["data"]["id"]
         trading_api.credentials.int_account = int_account
-        base_currency = detect_base_currency(client_details)
-        logged_in_at = datetime.now().isoformat()
 
-        # Nur diese wenigen, unkritischen Werte landen im KV-Store - NIE das
-        # Passwort. degiro_session_id erlaubt es, spaeter (siehe
-        # _build_trading_api_from_stored_session) ohne erneuten Login
-        # weiterzuarbeiten.
+        SESSION["trading_api"] = trading_api
+        SESSION["int_account"] = int_account
+        SESSION["user_token"] = user_token
+        SESSION["base_currency"] = detect_base_currency(client_details)
+        SESSION["logged_in_at"] = datetime.now().isoformat()
+        # Nur im RAM fuer die Dauer dieser Sitzung - nie auf Platte geschrieben.
+        # Ueberschreibt bewusst nicht mit None, falls dieses Login-Formular
+        # ohne Key abgeschickt wurde, aber vorher schon einer per Umgebungs-
+        # variable galt (siehe get_fmp_api_key()).
+        if fmp_api_key:
+            SESSION["fmp_api_key"] = fmp_api_key
+
         session_id = secrets.token_urlsafe(32)
-        kv_set_json(
-            f"degiro_session:{session_id}",
-            {
-                "degiro_session_id": trading_api.connection_storage.session_id,
-                "int_account": int_account,
-                "user_token": user_token,
-                "base_currency": base_currency,
-                "username": username,
-                "logged_in_at": logged_in_at,
-                "fmp_api_key": fmp_api_key,
-            },
-            SESSION_TTL_SECONDS,
-        )
-
-        logger.info("Login erfolgreich (int_account=%s, base_currency=%s)", int_account, base_currency)
-        response = jsonify({"success": True, "baseCurrency": base_currency})
+        SESSION_STORE[session_id] = SESSION.copy()
+        logger.info("Login erfolgreich (int_account=%s, base_currency=%s)", int_account, SESSION["base_currency"])
+        response = jsonify({"success": True, "baseCurrency": SESSION["base_currency"]})
         response.set_cookie(
             SESSION_COOKIE,
             session_id,
-            max_age=SESSION_TTL_SECONDS,
+            max_age=SESSION_MAX_AGE,
             httponly=True,
             secure=True,
             samesite="Lax",
@@ -727,7 +593,7 @@ def login():
         return jsonify({"error": f"Unerwarteter Fehler: {e}"}), 500
 
 
-def _connect_with_in_app_wait(trading_api: TradingAPI, max_wait_seconds: int = 45) -> None:
+def _connect_with_in_app_wait(trading_api: TradingAPI, max_wait_seconds: int = 90) -> None:
     """Verbindet sich; falls DEGIRO eine Bestaetigung in der App verlangt,
     wird bis zu max_wait_seconds gewartet (du musst dann in der DEGIRO-App bestaetigen)."""
     try:
@@ -754,15 +620,14 @@ def _connect_with_in_app_wait(trading_api: TradingAPI, max_wait_seconds: int = 4
 @app.route("/api/logout", methods=["POST"])
 @require_auth
 def logout():
+    session_id = request.cookies.get(SESSION_COOKIE, "")
+    SESSION_STORE.pop(session_id, None)
     trading_api = SESSION.get("trading_api")
     if trading_api is not None:
         try:
             trading_api.logout()
         except Exception:  # noqa: BLE001
             pass
-    session_id = request.cookies.get(SESSION_COOKIE)
-    if session_id and kv_available():
-        kv_delete(f"degiro_session:{session_id}")
     SESSION.update({
         "trading_api": None, "int_account": None, "user_token": None,
         "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
@@ -911,34 +776,43 @@ def transactions():
 # --- Endpunkte: Historie (seit Kauf, in CHF) ---------------------------------
 
 def _get_cash_and_deposits_history_chf(
-    trading_api, since_d: date, live_cash_chf: float | None, tx_items: list[dict], base_currency: str
+    trading_api, since_d: date, live_cash_chf: float | None
 ) -> tuple[dict[str, float], dict[str, float]]:
     """
     Liefert (Cash-Historie, kumulierte Netto-Einzahlungs-Historie), beide
-    taeglich in CHF.
+    taeglich in CHF, aus DEGIROs eigenen 'cashMovements'.
 
-    Cash-Historie: letzter gemeldeter Saldo je Tag aus DEGIROs eigenen
-    'cashMovements'. Wird gegen den live abgefragten aktuellen Cash-Stand
-    geprueft; weicht der letzte rekonstruierte Wert stark davon ab, ist das
-    'balance'-Format vermutlich nicht so wie angenommen (nicht offiziell
-    dokumentiert) - dann leer zurueckgeben (Aufrufer faellt auf eine flache,
-    korrekte Linie zurueck).
+    Cash-Historie: letzter gemeldeter Saldo je Tag. Wird gegen den live
+    abgefragten aktuellen Cash-Stand geprueft; weicht der letzte
+    rekonstruierte Wert stark davon ab, ist das 'balance'-Format vermutlich
+    nicht so wie angenommen (nicht offiziell dokumentiert) - dann leer
+    zurueckgeben (Aufrufer faellt auf eine flache, korrekte Linie zurueck).
 
-    Netto-Einzahlungen: NICHT durch Klassifizieren einzelner Kontobuchungen
-    bestimmt (zwei Anlaeufe damit - ueber 'type' geraten, dann ueber
-    Anwesenheit von 'productId' - waren beide nachweislich falsch: manche
-    Einzahlungen/Sweeps in den Cash-Fund tragen offenbar auch eine productId
-    und wurden faelschlich als Handel statt als Einzahlung gezaehlt, was die
-    Kennzahl bei jeder so verpassten Einzahlung sprunghaft nach oben trieb).
-    Stattdessen rein rechnerisch aus zwei bereits verlaesslichen Groessen
-    hergeleitet:
-        NettoEinzahlungen(t) = Cash-Saldo(t) - kumulierter Handels-Cashflow(t)
-    Der Handels-Cashflow kommt direkt aus der Transaktionshistorie (bereits
-    an anderer Stelle erfolgreich genutzt), nicht aus den mehrdeutigen
-    Kontobuchungen. Diese Herleitung setzt voraus, dass der Cash-Saldo am
-    allerersten Tag (since_d) noch keine Aktivität von vor since_d enthält -
-    zutreffend, da since_d der Tag der ersten je getaetigten Transaktion ist.
+    Netto-Einzahlungen: laufende Summe aller Buchungen OHNE productId (also
+    Bank-Ein-/Auszahlungen, nicht an ein Wertpapier gebundene Buchungen).
+    Buchungen MIT productId (Handel, Dividenden, Zinsen auf eine Position)
+    zaehlen bewusst NICHT als "Einzahlung" - so verzerrt das Kaufen
+    zusaetzlicher Aktien mit vorhandenem Kapital die Performance-Kennzahl
+    nicht, nur tatsaechlich frisch eingezahltes Geld tut das.
     """
+    try:
+        overview = trading_api.get_account_overview(
+            overview_request=OverviewRequest(from_date=since_d, to_date=date.today()),
+            raw=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
+        return {}, {}
+
+    movements = ((overview or {}).get("data") or {}).get("cashMovements") or []
+    if not movements:
+        return {}, {}
+
+    # Nicht auf die von der API gelieferte Reihenfolge verlassen - explizit
+    # chronologisch sortieren, damit "letzter Eintrag pro Tag" wirklich der
+    # spaeteste ist (manche Endpunkte liefern neueste zuerst).
+    movements_sorted = sorted(movements, key=lambda m: str(m.get("date") or ""))
+
     fx_cache_series: dict[str, dict[str, float]] = {}
 
     def _to_chf(ccy, amount, day: date) -> float:
@@ -949,25 +823,8 @@ def _get_cash_and_deposits_history_chf(
             fx_cache_series[ccy] = get_fx_series(since_d, date.today(), ccy, TARGET_CURRENCY)
         return _num(amount) * fx_rate_on(fx_cache_series[ccy], day, fallback=1.0)
 
-    try:
-        overview = trading_api.get_account_overview(
-            overview_request=OverviewRequest(from_date=since_d, to_date=date.today()),
-            raw=True,
-        )
-        movements = ((overview or {}).get("data") or {}).get("cashMovements") or []
-    except Exception:  # noqa: BLE001
-        logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
-        movements = []
-
-    # Diagnose: bisher wurde die Cash-Rekonstruktion aus 'balance' fuer dieses
-    # Konto konsequent verworfen. Bevor hier weiter geraten wird, einmal die
-    # tatsaechliche Rohstruktur ins Log schreiben (Konsole von proxy.py).
-    logger.info("cashMovements: %d Eintraege gefunden", len(movements))
-    for m in movements[:3]:
-        logger.info("  Beispiel-Buchung: %s", json.dumps(m, default=str, ensure_ascii=False))
-
     by_day_last: dict[str, dict] = {}
-    for m in sorted(movements, key=lambda m: str(m.get("date") or "")):
+    for m in movements_sorted:
         d = str(m.get("date") or "")[:10]
         if d:
             by_day_last[d] = m
@@ -987,39 +844,16 @@ def _get_cash_and_deposits_history_chf(
             )
             cash_result = {}
 
-    # WICHTIG: die Netto-Einzahlungs-Herleitung (weiter unten) braucht die
-    # ECHTE taegliche Cash-Historie. Ein flacher Naeherungswert als Ersatz
-    # wurde hier testweise versucht und war nachweislich falsch: er erzeugt
-    # an jedem Handelstag eine scheinbare "Einzahlung" in Hoehe des
-    # Handels-Cashflows (da ein konstanter Cash-Stand + ein negativer
-    # Handels-Cashflow rechnerisch wie eine Einzahlung aussieht), reproduziert
-    # also die urspruengliche Verzerrung nur in neuer Form. Daher hier bewusst
-    # KEIN Fallback: ohne verlaessliche Cash-Historie lieber keine
-    # Netto-Einzahlungs-Kurve zeigen als eine falsche.
-    if not cash_result:
-        return cash_result, {}
-
-    trade_cashflow_by_day: dict[str, float] = {}
-    running = 0.0
-    for t in sorted(tx_items, key=lambda x: str(x.get("date"))):
-        d = str(t.get("date"))[:10]
-        amount = t.get("totalPlusAllFeesInBaseCurrency")
-        if amount is None:
-            amount = t.get("totalInBaseCurrency")
-        day = date.fromisoformat(d)
-        running += _to_chf(base_currency, amount, day)
-        trade_cashflow_by_day[d] = running
-
-    filled_trade_cf = _forward_fill(trade_cashflow_by_day, since_d, date.today())
-    trade_cf_by_day = {c["date"]: (c["value"] or 0.0) for c in filled_trade_cf}
-    filled_cash = _forward_fill(cash_result, since_d, date.today())
-
     deposits_result: dict[str, float] = {}
-    for c in filled_cash:
-        d = c["date"]
-        if c["value"] is None:
+    running = 0.0
+    for m in movements_sorted:
+        if m.get("productId") is not None:
             continue
-        deposits_result[d] = c["value"] - trade_cf_by_day.get(d, 0.0)
+        d = str(m.get("date") or "")[:10]
+        if not d:
+            continue
+        running += _to_chf(m.get("currency"), m.get("change"), date.fromisoformat(d))
+        deposits_result[d] = running
 
     return cash_result, deposits_result
 
@@ -1084,9 +918,7 @@ def history_backfill():
         live_cash_amount, live_cash_ccy = _get_cash_available_to_trade(account_update)
         live_cash_chf = live_cash_amount * get_latest_fx_rate(live_cash_ccy, TARGET_CURRENCY)
 
-        cash_series, deposits_series = _get_cash_and_deposits_history_chf(
-            trading_api, earliest, live_cash_chf, tx_items, base_currency
-        )
+        cash_series, deposits_series = _get_cash_and_deposits_history_chf(trading_api, earliest, live_cash_chf)
         if not cash_series:
             # Rekonstruktion nicht verfuegbar/unplausibel - flache Linie mit dem
             # tatsaechlichen aktuellen Cash-Stand ist ehrlicher als eine falsche Kurve.
@@ -1359,44 +1191,36 @@ def closed_positions():
         return jsonify({"error": f"Fehler beim Abrufen der geschlossenen Positionen: {e}"}), 502
 
 
-# --- Statische Seiten (index.html, assets/*) --------------------------------
-# Werden bewusst aus DIESER Funktion heraus ausgeliefert (nicht separat ueber
-# Vercels statisches Hosting), damit der App-Passwortschutz (Basic Auth oben)
-# auch fuer die Seiten selbst gilt - sonst koennte jeder die statischen
-# Dateien ansehen, nur eben ohne funktionierende API-Aufrufe dahinter.
+def main():
+    parser = argparse.ArgumentParser(description="Lokaler DEGIRO-Proxy fuer das degiro-akad Dashboard")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--origin",
+        action="append",
+        default=None,
+        help="Erlaubter Origin der Webseite (mehrfach angebbar). Standard: https://mattieddie.github.io",
+    )
+    args = parser.parse_args()
 
-@app.route("/", methods=["GET"])
-def serve_index():
-    return send_from_directory(STATIC_ROOT, "index.html")
-
-
-@app.route("/assets/<path:filename>", methods=["GET"])
-def serve_assets(filename):
-    return send_from_directory(os.path.join(STATIC_ROOT, "assets"), filename)
-
-
-# --- Herkunft(en), von denen aus die API angesprochen werden darf -----------
-# Auf Vercel laufen Frontend und API i.d.R. same-origin (siehe oben), CORS
-# greift also normalerweise gar nicht. ALLOWED_ORIGIN kann in den Vercel-
-# Projekteinstellungen zusaetzlich gesetzt werden, falls die Seite doch von
-# woanders (z.B. lokal zum Testen) aus angesprochen werden soll.
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in (os.environ.get("ALLOWED_ORIGIN", "").split(",") + [
-        f"https://{os.environ.get('VERCEL_URL')}" if os.environ.get("VERCEL_URL") else "",
+    global ALLOWED_ORIGINS
+    ALLOWED_ORIGINS = args.origin or [
+        "https://mattieddie.github.io",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
-    ])
-    if origin.strip()
-]
+    ]
 
-if not APP_USERNAME or not APP_PASSWORD:
-    logger.warning(
-        "APP_USERNAME/APP_PASSWORD sind nicht gesetzt - die App bleibt bis dahin "
-        "fuer niemanden erreichbar (fail-closed), siehe enforce_app_password()."
-    )
-if not kv_available():
-    logger.warning(
-        "Kein KV-Store konfiguriert (KV_REST_API_URL/KV_REST_API_TOKEN bzw. "
-        "UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN fehlen) - Login wird fehlschlagen."
-    )
+    print("=" * 70)
+    print(" DEGIRO-Proxy laeuft lokal. Nichts wird gespeichert oder an GitHub gesendet.")
+    print(" Waehrungsumrechnung nach CHF via api.frankfurter.app (oeffentliche EZB-Kurse).")
+    print(f" Kursquellen: DEGIRO, Yahoo Finance, Financial Modeling Prep ({'aktiv' if FMP_API_KEY else 'kein FMP_API_KEY gesetzt - uebersprungen'})")
+    print(f" Erlaubte Herkunft(en): {', '.join(ALLOWED_ORIGINS)}")
+    print(f" Adresse: http://127.0.0.1:{args.port}")
+
+    print(" Beenden mit Strg+C")
+    print("=" * 70)
+
+    app.run(host="127.0.0.1", port=args.port, debug=False)
+
+
+if __name__ == "__main__":
+    main()

@@ -4,20 +4,7 @@ Privates Dashboard für den eigenen DEGIRO-Account: Performance-Graph und
 Auswertung der einzelnen Positionen, basierend auf der inoffiziellen
 Bibliothek [degiro-connector](https://github.com/Chavithra/degiro-connector).
 
-## Zwei Betriebsarten – wähle bewusst
-
-| | Lokaler Proxy (`local-proxy/proxy.py`) | Vercel-Deployment (`api/index.py`) |
-|---|---|---|
-| Wo laufen DEGIRO-Zugangsdaten durch? | **Nur dein eigener Rechner** | Dein Rechner **und** Vercels Server |
-| Erreichbar von | Nur diesem einen Gerät, nur wenn der Proxy läuft | Überall, jederzeit, über die Vercel-URL |
-| Zugriffsschutz | Kein fremder kommt an den Proxy heran (läuft nur auf `127.0.0.1`) | HTTP-Basic-Auth-Passwort für die ganze App nötig (siehe unten) |
-| Sitzungsspeicher | Nur RAM des lokalen Prozesses | Externer Key-Value-Store (Vercel KV/Upstash) – zeitlich befristet |
-| Am besten für | Maximale Kontrolle, „nichts verlässt meinen Rechner“ | Zugriff von überall (z.B. Handy unterwegs) |
-
-Beide Varianten nutzen denselben Frontend-Code und dieselbe DEGIRO-Anbindung
-(inkl. aller Kursquellen-Fixes). Der wesentliche Unterschied ist, **wo die
-DEGIRO-Sitzung lebt** und **wer potenziell Zugriff auf die Zwischenablage
-hat**. Lies dir das unten jeweils durch, bevor du dich entscheidest.
+**Live-Seite:** https://mattieddie.github.io/degiro-akad/
 
 ## Wie es funktioniert (wichtig zu verstehen)
 
@@ -37,19 +24,18 @@ Dieses Repository enthält **nur Code**, keine persönlichen Daten:
   ausschliesslich an deinen eigenen lokalen Proxy und von dort an DEGIRO.
 
 ```
-Browser  <-- http://127.0.0.1 -->  local-proxy/proxy.py (liefert auch die Web-Oberflaeche aus)  <-->  DEGIRO
-   |
-   v
-localStorage (nur auf deinem Gerät)
+Browser (GitHub Pages, statisch)  <-- lokal -->  local-proxy/proxy.py (127.0.0.1)  <-->  DEGIRO
+        |
+        v
+  localStorage (nur auf deinem Gerät)
 ```
 
-Die App funktioniert nur, **solange der lokale Proxy bei dir läuft**. Ohne
-laufenden Proxy zeigt der Browser die zuletzt lokal zwischengespeicherten
-Daten an.
+Die Seite funktioniert nur, **solange der lokale Proxy bei dir läuft**. Ohne
+laufenden Proxy zeigt sie die zuletzt lokal zwischengespeicherten Daten an.
 
-## Setup: Lokaler Proxy
+## Setup
 
-### 1. Proxy starten
+### 1. Lokalen Proxy vorbereiten
 
 ```bash
 cd local-proxy
@@ -57,10 +43,13 @@ pip install -r requirements.txt
 python proxy.py
 ```
 
-Öffne danach im Browser **http://127.0.0.1:8765/** – der Proxy liefert die
-Web-Oberfläche direkt selbst mit aus, kein GitHub Pages und kein separates
-Token nötig. (Die Sitzung läuft über ein Cookie, das der Proxy selbst
-setzt.)
+Die Konsole zeigt ein **Proxy-Token** an – das brauchst du gleich auf der
+Webseite. Falls dein GitHub-Pages-Link anders lautet als
+`https://mattieddie.github.io`, starte mit:
+
+```bash
+python proxy.py --origin https://<dein-nutzername>.github.io
+```
 
 **Optional: Financial Modeling Prep als dritte Kursquelle.** Falls DEGIRO
 und Yahoo Finance für eine Position keine Daten liefern, kann der Proxy
@@ -96,62 +85,18 @@ hartkodiert. Ohne einen der beiden Wege wird diese Quelle einfach
 geteilt hast (z.B. in einem Chat), empfiehlt es sich, ihn bei Financial
 Modeling Prep zu regenerieren.
 
-### 2. Anmelden
+### 2. Webseite öffnen
 
-Auf http://127.0.0.1:8765/ eintragen:
+Öffne https://mattieddie.github.io/degiro-akad/ (oder lokal via
+`python -m http.server 8000` im Repo-Root und dann `http://localhost:8000`).
+
+Trage ein:
+- **Proxy-Adresse**: `http://127.0.0.1:8765` (Standard)
+- **Proxy-Token**: aus der Konsolenausgabe von `proxy.py`
 - **DEGIRO-Benutzername / -Passwort**
 - **TOTP-Secret**: nur falls du 2FA per Authenticator-App aktiviert hast
-- **Financial Modeling Prep API-Key**: optional, siehe oben
 
 Klick auf **„Verbinden & Daten laden“**.
-
-## Setup: Vercel-Deployment (Alternative – Zugriff von überall)
-
-**Wichtig:** Lies zuerst den Abschnitt „Zwei Betriebsarten" oben – bei
-dieser Variante läuft deine DEGIRO-Sitzung serverseitig auf Vercel, nicht
-nur auf deinem eigenen Rechner.
-
-### 1. Repo mit Vercel verbinden
-
-Falls noch nicht geschehen: in [vercel.com](https://vercel.com) ein neues
-Projekt aus diesem GitHub-Repo anlegen. Vercel erkennt `api/index.py`
-automatisch als Python-Funktion (Flask/WSGI) und `vercel.json` regelt das
-Routing so, dass auch die statischen Seiten durch den Passwortschutz laufen.
-
-### 2. Umgebungsvariablen setzen (Project Settings → Environment Variables)
-
-| Variable | Zweck | Pflicht? |
-|---|---|---|
-| `APP_USERNAME` | Benutzername für den Zugriffsschutz der ganzen App | **Ja** – ohne bleibt die App für niemanden erreichbar (fail-closed) |
-| `APP_PASSWORD` | Passwort dazu | **Ja** |
-| `KV_REST_API_URL` + `KV_REST_API_TOKEN`<br>*(oder `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`)* | Externer Speicher für die DEGIRO-Sitzung zwischen einzelnen Serverless-Aufrufen | **Ja** – ohne schlägt der Login fehl |
-| `FMP_API_KEY` | Dritte Kursquelle | Optional |
-| `ALLOWED_ORIGIN` | Zusätzliche erlaubte Herkunft für CORS (Frontend/API laufen normalerweise eh same-origin) | Optional |
-
-Für den KV-Store: im Vercel-Dashboard unter *Storage* eine **Upstash for
-Redis**-Integration hinzufügen (kostenloser Tier reicht bei weitem für
-persönlichen Gebrauch) – Vercel trägt die zugehörigen Umgebungsvariablen
-dann automatisch ein.
-
-### 3. Deployen und öffnen
-
-Nach dem Setzen der Variablen: Deploy auslösen (Push auf `main` reicht,
-sofern die Vercel-Integration bereits aktiv ist). Die App unter deiner
-`*.vercel.app`-URL öffnen – der Browser fragt zuerst per Basic-Auth-Dialog
-nach `APP_USERNAME`/`APP_PASSWORD`, danach erscheint dieselbe Oberfläche wie
-lokal, inkl. DEGIRO-Login-Formular.
-
-### Wie die Sitzung ohne dauerhaften Server funktioniert
-
-Vercel-Funktionen sind zustandslos – jede Anfrage kann eine neue Instanz
-treffen. Damit du trotzdem eingeloggt bleibst, wird beim Login **nicht**
-dein Passwort, sondern nur die von DEGIRO vergebene Session-ID (plus
-Kontonummer, Basiswährung) für einige Stunden im externen KV-Store abgelegt,
-adressiert über ein zufälliges HttpOnly-Cookie in deinem Browser. Bei jeder
-weiteren Anfrage wird daraus eine frische Verbindung zu DEGIRO
-wiederhergestellt, ohne dich erneut einzuloggen (`degiro-connector` erlaubt
-das, weil Verbindungszustand und Zugangsdaten getrennte, austauschbare
-Objekte sind). Logout bzw. Ablauf der Frist löscht den KV-Eintrag.
 
 ### 3. GitHub Pages aktivieren (einmalig, falls noch nicht geschehen)
 
@@ -295,18 +240,9 @@ Preis-Toleranz selbst aufzuweichen).
 - **Öffentliches Repo**: Der Code in diesem Repository ist öffentlich
   einsehbar. Er enthält **keine** Zugangsdaten oder Kontodaten – die
   entstehen erst zur Laufzeit lokal bei dir.
-- **Proxy-Bindung (lokale Variante)**: `local-proxy/proxy.py` bindet
-  ausschliesslich an `127.0.0.1` und ist damit nur von deinem eigenen
-  Rechner aus erreichbar.
-- **Vercel-Variante**: deine DEGIRO-Zugangsdaten werden bei jedem Login an
-  Vercels Server übertragen (dort nie gespeichert, nur zur Anmeldung
-  verwendet). Was danach für die laufende Sitzung nötig ist (Session-ID,
-  Kontonummer, Basiswährung – **nicht** das Passwort) liegt befristet in
-  einem externen KV-Store. Die ganze App ist zusätzlich per HTTP-Basic-Auth
-  geschützt (`APP_USERNAME`/`APP_PASSWORD`) – ohne diese beiden
-  Umgebungsvariablen bleibt die App absichtlich für niemanden erreichbar.
-  Wäge bewusst ab, ob dir das lokale oder das gehostete Modell lieber ist
-  (siehe Tabelle oben).
+- **Proxy-Bindung**: `proxy.py` bindet ausschliesslich an `127.0.0.1`
+  (nicht ans Netzwerk erreichbar) und verlangt für jede Anfrage das beim
+  Start ausgegebene Token.
 - **Externe FX-API**: Für die CHF-Umrechnung kontaktiert der Proxy
   `api.frankfurter.app`. Dabei werden ausschliesslich Währungscodes und
   Datumswerte übertragen – keine Konto- oder Portfoliodaten.
