@@ -632,7 +632,9 @@ def logout():
         "trading_api": None, "int_account": None, "user_token": None,
         "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
     })
-    return jsonify({"success": True})
+    response = jsonify({"success": True})
+    response.delete_cookie(SESSION_COOKIE)
+    return response
 
 
 # --- Endpunkte: Portfolio -----------------------------------------------------
@@ -1213,6 +1215,7 @@ def main():
     print(f" Kursquellen: DEGIRO, Yahoo Finance, Financial Modeling Prep ({'aktiv' if FMP_API_KEY else 'kein FMP_API_KEY gesetzt - uebersprungen'})")
     print(f" Erlaubte Herkunft(en): {', '.join(ALLOWED_ORIGINS)}")
     print(f" Adresse: http://127.0.0.1:{args.port}")
+
     print(" Beenden mit Strg+C")
     print("=" * 70)
 

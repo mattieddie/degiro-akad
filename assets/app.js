@@ -1,11 +1,9 @@
 "use strict";
 
 /*
- * Alle Daten (Proxy-Adresse/-Token, Portfolio, Transaktionen, Verlauf) werden
- * ausschliesslich im localStorage dieses Browsers gehalten. Nichts davon wird
- * jemals an GitHub oder einen anderen Server als den lokalen Proxy gesendet.
- * Das DEGIRO-Passwort selbst wird NIE gespeichert - es wird bei jedem
- * "Verbinden" neu eingegeben und nur an den lokalen Proxy uebermittelt.
+ * Portfolio, Transaktionen und Verlauf werden lokal gehalten. Das DEGIRO-Passwort
+ * wird NIE gespeichert und bei jeder Verbindung ausschließlich an das Backend
+ * übermittelt. Die Backend-Sitzung läuft über ein HttpOnly-Cookie.
  *
  * Alle Geldbetraege werden vom Proxy bereits in CHF umgerechnet geliefert.
  *
@@ -18,8 +16,6 @@
  */
 
 const LS_KEYS = {
-  proxyUrl: "degiro_proxy_url",
-  proxyToken: "degiro_proxy_token",
   username: "degiro_username",
   portfolio: "degiro_portfolio",
   transactions: "degiro_transactions",
@@ -55,11 +51,7 @@ function saveLocal(key, value) {
 }
 
 function proxyUrl() {
-  return (el("input-proxy-url").value || "http://127.0.0.1:8765").replace(/\/$/, "");
-}
-
-function proxyToken() {
-  return el("input-proxy-token").value.trim();
+  return "";
 }
 
 function setMessage(text, kind) {
@@ -89,9 +81,9 @@ function fmtNative(value, currency) {
 async function proxyFetch(path, options = {}) {
   const res = await fetch(proxyUrl() + path, {
     ...options,
+    credentials: "include",
     headers: {
       "Content-Type": "application/json",
-      Authorization: "Bearer " + proxyToken(),
       ...(options.headers || {}),
     },
   });
@@ -539,10 +531,6 @@ async function connectAndLoad() {
   const totp = el("input-totp").value.trim();
   const fmpKey = el("input-fmp-key").value.trim();
 
-  if (!proxyToken()) {
-    setMessage("Bitte das Proxy-Token eintragen (wird beim Start von proxy.py angezeigt).", "error");
-    return;
-  }
   if (!username || !password) {
     setMessage("Benutzername und Passwort werden benoetigt (werden nicht gespeichert).", "error");
     return;
@@ -557,8 +545,6 @@ async function connectAndLoad() {
       body: JSON.stringify({ username, password, totp_secret_key: totp || undefined, fmp_api_key: fmpKey || undefined }),
     });
 
-    saveLocal(LS_KEYS.proxyUrl, proxyUrl());
-    saveLocal(LS_KEYS.proxyToken, proxyToken());
     saveLocal(LS_KEYS.username, username);
     if (fmpKey) saveLocal(LS_KEYS.fmpKey, fmpKey);
     el("input-password").value = "";
@@ -632,8 +618,6 @@ function clearLocalData() {
 }
 
 function restoreInputsFromCache() {
-  el("input-proxy-url").value = loadLocal(LS_KEYS.proxyUrl, "http://127.0.0.1:8765");
-  el("input-proxy-token").value = loadLocal(LS_KEYS.proxyToken, "");
   el("input-username").value = loadLocal(LS_KEYS.username, "");
   el("input-fmp-key").value = loadLocal(LS_KEYS.fmpKey, "");
 }
@@ -647,8 +631,7 @@ restoreInputsFromCache();
 renderAllFromCache();
 
 // Falls schon einmal verbunden: Online-Status pruefen, ohne Passwort erneut abzufragen.
-if (loadLocal(LS_KEYS.proxyToken, "")) {
-  proxyFetch("/api/health")
+proxyFetch("/api/health")
     .then((res) => setOnlineBadge(!!res.logged_in))
     .catch(() => setOnlineBadge(false));
 }
