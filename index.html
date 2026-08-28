@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>degiro-akad Dashboard</title>
+<link rel="stylesheet" href="assets/styles.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+<header class="topbar">
+  <h1>degiro-akad</h1>
+  <div id="status-badge" class="badge badge--offline">Nicht verbunden</div>
+</header>
+
+<main>
+  <section id="panel-connect" class="card">
+    <h2>Verbindung zum lokalen Proxy</h2>
+    <p class="hint">
+      Alle Daten bleiben ausschliesslich in deinem Browser (localStorage) und auf deinem Rechner.
+      Es wird nichts an GitHub gesendet. Starte zuerst den lokalen Proxy
+      (<code>local-proxy/proxy.py</code>) und trage unten das beim Start angezeigte Proxy-Token ein.
+    </p>
+    <div class="grid">
+      <label>Proxy-Adresse
+        <input id="input-proxy-url" type="text" placeholder="http://127.0.0.1:8765" />
+      </label>
+      <label>Proxy-Token
+        <input id="input-proxy-token" type="password" placeholder="beim Start des Proxys angezeigt" />
+      </label>
+      <label>DEGIRO-Benutzername
+        <input id="input-username" type="text" autocomplete="username" />
+      </label>
+      <label>DEGIRO-Passwort
+        <input id="input-password" type="password" autocomplete="current-password" />
+      </label>
+      <label>TOTP-Secret (optional, falls 2FA aktiv)
+        <input id="input-totp" type="password" placeholder="nur falls 2FA per Authenticator-App aktiv ist" />
+      </label>
+    </div>
+    <div class="actions">
+      <button id="btn-connect">Verbinden &amp; Daten laden</button>
+      <button id="btn-refresh" class="secondary" disabled>Aktualisieren</button>
+      <button id="btn-disconnect" class="secondary" disabled>Trennen</button>
+      <button id="btn-clear" class="danger">Lokale Daten löschen</button>
+    </div>
+    <p id="connect-message" class="message"></p>
+  </section>
+
+  <section id="panel-summary" class="cards hidden">
+    <div class="card stat">
+      <span class="stat-label">Gesamtwert (Equity)</span>
+      <span id="stat-equity" class="stat-value">–</span>
+    </div>
+    <div class="card stat">
+      <span class="stat-label">Cash</span>
+      <span id="stat-cash" class="stat-value">–</span>
+    </div>
+    <div class="card stat">
+      <span class="stat-label">Positionswert</span>
+      <span id="stat-positions" class="stat-value">–</span>
+    </div>
+    <div class="card stat">
+      <span class="stat-label">Zuletzt aktualisiert</span>
+      <span id="stat-updated" class="stat-value">–</span>
+    </div>
+  </section>
+
+  <section id="panel-chart" class="card hidden">
+    <h2>Performance über Zeit</h2>
+    <p class="hint">
+      Der Verlauf wird lokal in deinem Browser aufgebaut: jedes Mal, wenn du diese Seite mit
+      laufendem Proxy öffnest, wird ein Datenpunkt für den heutigen Tag hinzugefügt.
+      Es gibt keine rückwirkende Historie von DEGIRO.
+    </p>
+    <canvas id="chart-history" height="90"></canvas>
+  </section>
+
+  <section id="panel-positions" class="card hidden">
+    <h2>Positionen</h2>
+    <div class="table-wrap">
+      <table id="table-positions">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Symbol</th>
+            <th>Stück</th>
+            <th>Kurs</th>
+            <th>Wert</th>
+            <th>Anteil</th>
+            <th>Ø Einstand</th>
+            <th>Unreal. G/V</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="panel-transactions" class="card hidden">
+    <h2>Letzte Transaktionen</h2>
+    <div class="table-wrap">
+      <table id="table-transactions">
+        <thead>
+          <tr>
+            <th>Datum</th>
+            <th>Produkt-ID</th>
+            <th>Kauf/Verkauf</th>
+            <th>Menge</th>
+            <th>Preis</th>
+            <th>Gesamt</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>Inoffizielles, privates Dashboard auf Basis von <code>degiro-connector</code>. Keine Verbindung zu DEGIRO N.V. Keine Anlageberatung.</p>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

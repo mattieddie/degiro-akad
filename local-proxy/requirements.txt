@@ -1,0 +1,2 @@
+degiro-connector>=3.0.35
+flask>=3.0.0
