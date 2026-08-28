@@ -550,11 +550,19 @@ def enforce_app_password():
     if request.method == "OPTIONS":
         return None
     if not _check_basic_auth():
-        return Response(
-            "Zugriff verweigert. APP_USERNAME/APP_PASSWORD in Vercel gesetzt?",
-            401,
-            {"WWW-Authenticate": 'Basic realm="degiro-akad"'},
-        )
+        message = "Zugriff verweigert. APP_USERNAME/APP_PASSWORD in Vercel gesetzt?"
+        headers = {"WWW-Authenticate": 'Basic realm="degiro-akad"'}
+        # Fuer /api/*-Aufrufe (vom Frontend per fetch() konsumiert) JSON liefern,
+        # damit proxyFetch() den echten Grund anzeigen kann statt der
+        # generischen "Proxy-Fehler (HTTP 401)"-Fallback-Meldung. Fuer normale
+        # Seitenaufrufe reicht Klartext, der WWW-Authenticate-Header loest so
+        # oder so den nativen Browser-Login-Dialog aus.
+        if request.path.startswith("/api/"):
+            resp = jsonify({"error": message})
+            resp.status_code = 401
+            resp.headers.update(headers)
+            return resp
+        return Response(message, 401, headers)
     return None
 
 
