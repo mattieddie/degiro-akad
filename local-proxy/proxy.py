@@ -619,15 +619,25 @@ def transactions():
 
 # --- Endpunkte: Historie (seit Kauf, in CHF) ---------------------------------
 
-def _get_cash_history_chf(trading_api, since_d: date, live_cash_chf: float | None) -> dict[str, float]:
+def _get_cash_and_deposits_history_chf(
+    trading_api, since_d: date, live_cash_chf: float | None
+) -> tuple[dict[str, float], dict[str, float]]:
     """
-    Exakte taegliche Cash-Historie aus DEGIROs eigenen 'cashMovements' (inkl.
-    laufendem Saldo je Buchung), nach CHF umgerechnet. Wird zusaetzlich gegen
-    den live abgefragten aktuellen Cash-Stand geprueft: weicht der letzte
+    Liefert (Cash-Historie, kumulierte Netto-Einzahlungs-Historie), beide
+    taeglich in CHF, aus DEGIROs eigenen 'cashMovements'.
+
+    Cash-Historie: letzter gemeldeter Saldo je Tag. Wird gegen den live
+    abgefragten aktuellen Cash-Stand geprueft; weicht der letzte
     rekonstruierte Wert stark davon ab, ist das 'balance'-Format vermutlich
-    nicht so wie angenommen (nicht offiziell dokumentiert) - dann lieber
-    leer zurueckgeben (Aufrufer faellt auf eine flache, korrekte Linie
-    zurueck), statt eine falsche Kurve zu zeigen.
+    nicht so wie angenommen (nicht offiziell dokumentiert) - dann leer
+    zurueckgeben (Aufrufer faellt auf eine flache, korrekte Linie zurueck).
+
+    Netto-Einzahlungen: laufende Summe aller Buchungen OHNE productId (also
+    Bank-Ein-/Auszahlungen, nicht an ein Wertpapier gebundene Buchungen).
+    Buchungen MIT productId (Handel, Dividenden, Zinsen auf eine Position)
+    zaehlen bewusst NICHT als "Einzahlung" - so verzerrt das Kaufen
+    zusaetzlicher Aktien mit vorhandenem Kapital die Performance-Kennzahl
+    nicht, nur tatsaechlich frisch eingezahltes Geld tut das.
     """
     try:
         overview = trading_api.get_account_overview(
@@ -636,49 +646,60 @@ def _get_cash_history_chf(trading_api, since_d: date, live_cash_chf: float | Non
         )
     except Exception:  # noqa: BLE001
         logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
-        return {}
+        return {}, {}
 
     movements = ((overview or {}).get("data") or {}).get("cashMovements") or []
     if not movements:
-        return {}
+        return {}, {}
 
     # Nicht auf die von der API gelieferte Reihenfolge verlassen - explizit
     # chronologisch sortieren, damit "letzter Eintrag pro Tag" wirklich der
     # spaeteste ist (manche Endpunkte liefern neueste zuerst).
     movements_sorted = sorted(movements, key=lambda m: str(m.get("date") or ""))
 
+    fx_cache_series: dict[str, dict[str, float]] = {}
+
+    def _to_chf(ccy, amount, day: date) -> float:
+        if not isinstance(ccy, str) or len(ccy) != 3 or not ccy.isalpha():
+            return 0.0
+        ccy = ccy.upper()
+        if ccy not in fx_cache_series:
+            fx_cache_series[ccy] = get_fx_series(since_d, date.today(), ccy, TARGET_CURRENCY)
+        return _num(amount) * fx_rate_on(fx_cache_series[ccy], day, fallback=1.0)
+
     by_day_last: dict[str, dict] = {}
     for m in movements_sorted:
         d = str(m.get("date") or "")[:10]
-        if not d:
-            continue
-        by_day_last[d] = m
+        if d:
+            by_day_last[d] = m
 
-    fx_cache_series: dict[str, dict[str, float]] = {}
-    result: dict[str, float] = {}
+    cash_result: dict[str, float] = {}
     for d, movement in sorted(by_day_last.items()):
         balance = movement.get("balance") or {}
         day = date.fromisoformat(d)
-        total_chf = 0.0
-        for ccy, amount in balance.items():
-            if not isinstance(ccy, str) or len(ccy) != 3 or not ccy.isalpha():
-                continue  # unerwarteter Schluessel im balance-dict - nicht blind als Waehrung behandeln
-            ccy = ccy.upper()
-            if ccy not in fx_cache_series:
-                fx_cache_series[ccy] = get_fx_series(since_d, date.today(), ccy, TARGET_CURRENCY)
-            total_chf += _num(amount) * fx_rate_on(fx_cache_series[ccy], day, fallback=1.0)
-        result[d] = total_chf
+        cash_result[d] = sum(_to_chf(ccy, amount, day) for ccy, amount in balance.items())
 
-    if result and live_cash_chf is not None:
-        last_value = result[max(result)]
+    if cash_result and live_cash_chf is not None:
+        last_value = cash_result[max(cash_result)]
         if last_value <= 0 or abs(last_value - live_cash_chf) > max(200.0, live_cash_chf * 0.5):
             logger.warning(
                 "Cash-Historie wirkt unplausibel (rekonstruiert=%.2f, live=%.2f) - verwende flachen aktuellen Wert",
                 last_value, live_cash_chf,
             )
-            return {}
+            cash_result = {}
 
-    return result
+    deposits_result: dict[str, float] = {}
+    running = 0.0
+    for m in movements_sorted:
+        if m.get("productId") is not None:
+            continue
+        d = str(m.get("date") or "")[:10]
+        if not d:
+            continue
+        running += _to_chf(m.get("currency"), m.get("change"), date.fromisoformat(d))
+        deposits_result[d] = running
+
+    return cash_result, deposits_result
 
 
 def _forward_fill(series_by_day: dict[str, float], start_d: date, end_d: date) -> list[dict]:
@@ -741,7 +762,7 @@ def history_backfill():
         live_cash_amount, live_cash_ccy = _get_cash_available_to_trade(account_update)
         live_cash_chf = live_cash_amount * get_latest_fx_rate(live_cash_ccy, TARGET_CURRENCY)
 
-        cash_series = _get_cash_history_chf(trading_api, earliest, live_cash_chf)
+        cash_series, deposits_series = _get_cash_and_deposits_history_chf(trading_api, earliest, live_cash_chf)
         if not cash_series:
             # Rekonstruktion nicht verfuegbar/unplausibel - flache Linie mit dem
             # tatsaechlichen aktuellen Cash-Stand ist ehrlicher als eine falsche Kurve.
@@ -810,6 +831,8 @@ def history_backfill():
 
         filled_cash = _forward_fill(cash_series, earliest, date.today()) if cash_series else []
         cash_by_day = {c["date"]: c["value"] for c in filled_cash}
+        filled_deposits = _forward_fill(deposits_series, earliest, date.today()) if deposits_series else []
+        deposits_by_day = {c["date"]: c["value"] for c in filled_deposits}
 
         series = []
         d = earliest
@@ -817,11 +840,13 @@ def history_backfill():
             iso = d.isoformat()
             positions_value = round(daily_value_chf.get(iso, 0.0), 2)
             cash_v = cash_by_day.get(iso)
+            deposits_v = deposits_by_day.get(iso)
             series.append({
                 "date": iso,
                 "positionsValueChf": positions_value,
                 "cashChf": round(cash_v, 2) if cash_v is not None else None,
                 "equityChf": round(positions_value + (cash_v or 0.0), 2),
+                "netDepositsChf": round(deposits_v, 2) if deposits_v is not None else None,
             })
             d += timedelta(days=1)
 
@@ -829,7 +854,7 @@ def history_backfill():
             "since": earliest.isoformat(),
             "series": series,
             "positions": per_product_meta,
-            "note": "used=true: echter Kursverlauf verwendet (source=degiro: DEGIRO-Kurschart; source=yahoo: DEGIRO nicht verifizierbar, Yahoo Finance stattdessen erfolgreich verifiziert). used=false: kein verifizierter Kursverlauf gefunden, es wird ein Naeherungswert (letzter bekannter Kurs, flach) verwendet.",
+            "note": "used=true: echter Kursverlauf verwendet (source=degiro: DEGIRO-Kurschart; source=yahoo: DEGIRO nicht verifizierbar, Yahoo Finance stattdessen erfolgreich verifiziert). used=false: kein verifizierter Kursverlauf gefunden, es wird ein Naeherungswert (letzter bekannter Kurs, flach) verwendet. netDepositsChf: kumulierte Netto-Einzahlungen (Basis der einzahlungsbereinigten %-Performance).",
         })
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler bei der Historien-Rekonstruktion")

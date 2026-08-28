@@ -126,10 +126,20 @@ Serie clientseitig. Da nur Tageswerte (kein Intraday) erfasst werden, zeigt
 „1T“ entsprechend wenig Auflösung.
 
 Über die Buttons „Wert (CHF)“ / „Performance (%)“ lässt sich zwischen
-absoluter Wertdarstellung und der prozentualen Veränderung relativ zum
-ersten Tag im gewählten Zeitraum umschalten. Die %-Ansicht ist eine einfache
-Wertveränderung (nicht um Ein-/Auszahlungen bereinigt) – eine Einzahlung
-mitten im gewählten Zeitraum zeigt sich also mit als „Performance“.
+absoluter Wertdarstellung und einzahlungsbereinigter Performance umschalten:
+
+```
+Performance(%) = (Depotwert − kumulierte Netto-Einzahlungen) / kumulierte Netto-Einzahlungen
+```
+
+Kumulierte Netto-Einzahlungen sind die laufende Summe aller Kontobuchungen
+**ohne** `productId` (also Bank-Ein-/Auszahlungen) aus DEGIROs Kontoauszug –
+Buchungen **mit** `productId` (Handel, Dividenden, Zinsen auf eine Position)
+zählen bewusst nicht dazu. Zahlst du Geld ein und kaufst davon Aktien,
+steigt der Nenner sofort mit, der Zähler (Depotwert) aber erst durch
+tatsächliche Kursgewinne – eine Einzahlung erzeugt also keinen künstlichen
+Sprung nach oben, sondern höchstens eine kurze Verwässerung, bis sich die
+neu gekauften Positionen entwickeln.
 
 ## Positions-Detailansicht
 

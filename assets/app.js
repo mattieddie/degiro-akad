@@ -124,10 +124,14 @@ function appendHistoryPoint(totals) {
 function mergeHistorySeries(backfill, organic) {
   const byDate = new Map();
   for (const row of backfill || []) {
-    byDate.set(row.date, { date: row.date, equity: row.equityChf, cash: row.cashChf });
+    byDate.set(row.date, { date: row.date, equity: row.equityChf, cash: row.cashChf, netDeposits: row.netDepositsChf });
   }
   for (const row of organic || []) {
-    byDate.set(row.date, { date: row.date, equity: row.equity, cash: row.cash });
+    // netDeposits kommt nur vom Backfill (Proxy) - beim Ueberschreiben mit dem
+    // exakten lokalen Tages-Snapshot fuer denselben Tag uebernehmen, sonst
+    // reisst die einzahlungsbereinigte %-Kurve an dieser Stelle ab.
+    const existing = byDate.get(row.date);
+    byDate.set(row.date, { date: row.date, equity: row.equity, cash: row.cash, netDeposits: existing ? existing.netDeposits : undefined });
   }
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
@@ -156,10 +160,15 @@ function renderChart(fullSeries) {
   if (historyChart) historyChart.destroy();
 
   if (currentMode === "percent") {
-    el("chart-title").textContent = "Performance seit Range-Start (%)";
-    const basePoint = series.find((h) => h.equity !== null && h.equity !== undefined && h.equity !== 0);
-    const base = basePoint ? basePoint.equity : null;
-    const pct = series.map((h) => (base && h.equity !== null && h.equity !== undefined ? ((h.equity / base) - 1) * 100 : null));
+    el("chart-title").textContent = "Performance seit Kauf, einzahlungsbereinigt (%)";
+    // (Depotwert - kumulierte Netto-Einzahlungen) / kumulierte Netto-Einzahlungen.
+    // Dadurch zaehlt eine Einzahlung plus Aktienkauf NICHT als Performance -
+    // nur die tatsaechliche Wertentwicklung ab dem jeweiligen Kaufzeitpunkt.
+    const pct = series.map((h) => {
+      if (h.netDeposits === null || h.netDeposits === undefined || h.netDeposits <= 0) return null;
+      if (h.equity === null || h.equity === undefined) return null;
+      return ((h.equity - h.netDeposits) / h.netDeposits) * 100;
+    });
     historyChart = new Chart(ctx, {
       type: "line",
       data: {

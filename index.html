@@ -88,8 +88,9 @@
       Seit-Kauf-Verlauf wird aus deiner Transaktionshistorie und DEGIRO-Kurscharts (bzw. Yahoo Finance
       als Fallback) rekonstruiert (Näherung, siehe Hinweis unten) und danach lokal mit echten
       Tages-Schnappschüssen ergänzt, sobald du die Seite mit laufendem Proxy öffnest.
-      „Performance (%)“ zeigt die Wertveränderung relativ zum ersten Tag im gewählten Zeitraum
-      (inkl. etwaiger Ein-/Auszahlungen in diesem Zeitraum).
+      „Performance (%)“ ist einzahlungsbereinigt: (Depotwert − kumulierte Netto-Einzahlungen) /
+      kumulierte Netto-Einzahlungen. Eine Einzahlung plus Aktienkauf zählt damit nicht als
+      Performance – nur die tatsächliche Wertentwicklung ab dem jeweiligen Kaufzeitpunkt.
     </p>
     <p id="history-note" class="hint"></p>
     <canvas id="chart-history" height="90"></canvas>
