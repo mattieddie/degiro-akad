@@ -164,8 +164,20 @@ def get_latest_fx_rate(from_ccy: str, to_ccy: str) -> float:
 
 
 def detect_base_currency(client_details: dict) -> str:
+    """
+    "baseCurrency" ist DEGIROs tatsaechliche Konto-/Reporting-Waehrung - in
+    dieser Waehrung sind sowohl das "value"-Feld jeder Portfolio-Position
+    (siehe portfolio()) als auch alle "...InBaseCurrency"-Felder der
+    Transaktionshistorie bereits angegeben. "currency" ist dagegen offenbar
+    nur eine Kursanzeige-Praeferenz (bei diesem Konto z.B. "EUR", obwohl die
+    tatsaechliche Basiswaehrung CHF ist) und wurde vorher faelschlich zuerst
+    verwendet - das fuehrte zu einer doppelten (zu tiefen) Umrechnung bei
+    Positionswert, realisiertem G/V, Transaktionsgebuehren und
+    Netto-Einzahlungen, bestaetigt anhand des vom Nutzer separat
+    verifizierten tatsaechlichen Gesamtwerts.
+    """
     data = (client_details or {}).get("data", {})
-    return data.get("currency") or data.get("baseCurrency") or "EUR"
+    return data.get("baseCurrency") or data.get("currency") or "EUR"
 
 
 # --- Hilfsfunktionen: historische Kurse (DEGIRO vwd-Chart-API) --------------
@@ -565,6 +577,12 @@ def login():
         SESSION["user_token"] = user_token
         SESSION["base_currency"] = detect_base_currency(client_details)
         SESSION["logged_in_at"] = datetime.now().isoformat()
+        logger.info(
+            "client_details Waehrungsfelder: currency=%s baseCurrency=%s -> verwendet=%s",
+            client_details.get("data", {}).get("currency"),
+            client_details.get("data", {}).get("baseCurrency"),
+            SESSION["base_currency"],
+        )
         # Nur im RAM fuer die Dauer dieser Sitzung - nie auf Platte geschrieben.
         # Ueberschreibt bewusst nicht mit None, falls dieses Login-Formular
         # ohne Key abgeschickt wurde, aber vorher schon einer per Umgebungs-
@@ -681,11 +699,25 @@ def portfolio():
             size = _num(p.get("size"))
             price = _num(p.get("price"))
             avg_price = _num(p.get("breakEvenPrice")) or _num(p.get("averagePrice"))
-            value_native = p.get("value")
-            value_native = _num(value_native) if value_native is not None else size * price
 
             fx = get_latest_fx_rate(currency, TARGET_CURRENCY)
-            value_chf = value_native * fx
+            raw_value = p.get("value")
+            if raw_value is not None:
+                # DEGIROs eigenes "value"-Feld ist bereits in der Konto-
+                # Basiswaehrung (base_currency, siehe detect_base_currency())
+                # angegeben - NICHT in der Notierungswaehrung der Boerse
+                # (p["currency"], z.B. EUR fuer eine an einer EUR-Boerse
+                # gehandelte Position, waehrend die Basiswaehrung z.B. CHF
+                # ist). Nochmals ueber den Boersen-FX-Kurs umzurechnen wuerde
+                # diesen Wert ein zweites Mal (und damit zu tief) umrechnen -
+                # bestaetigt, weil das genau den vom Nutzer separat
+                # verifizierten Gesamtwert traf. Stattdessen nur ueber
+                # Basiswaehrung->CHF umrechnen (meist ein No-Op).
+                value_native = _num(raw_value)
+                value_chf = value_native * get_latest_fx_rate(base_currency, TARGET_CURRENCY)
+            else:
+                value_native = size * price
+                value_chf = value_native * fx
             avg_cost_chf = avg_price * fx
             # Unrealisierter G/V = Stueck * (aktueller Kurs - Einstandskurs), in Originalwaehrung,
             # dann nach CHF umgerechnet. (Vorher faelschlich das mehrdeutige "plBase"-Feld verwendet.)
@@ -742,17 +774,56 @@ def portfolio():
 @require_login
 def transactions():
     trading_api = SESSION["trading_api"]
+    base_currency = SESSION["base_currency"] or "EUR"
     days = int(request.args.get("days", 3650))
+    since_d = date.today() - timedelta(days=days)
     try:
         history = trading_api.get_transactions_history(
-            transaction_request=HistoryRequest(
-                from_date=date.today() - timedelta(days=days),
-                to_date=date.today(),
-            ),
+            transaction_request=HistoryRequest(from_date=since_d, to_date=date.today()),
             raw=False,
         )
         items = _json_safe(history.data if hasattr(history, "data") else history)
-        return jsonify({"fetchedAt": datetime.now().isoformat(), "transactions": items})
+
+        # DEGIROs "totalInBaseCurrency" ist der reine Handelswert ohne
+        # Gebuehren; "totalPlusAllFeesInBaseCurrency" enthaelt Kauf-/Verkaufs-
+        # gebuehren bereits (das ist auch die Zahl, die an anderer Stelle fuer
+        # realisiertes G/V und Netto-Einzahlungen verwendet wird - siehe
+        # closed_positions()). Gebuehr = Differenz der beiden, das
+        # funktioniert vorzeichenunabhaengig fuer Kauf UND Verkauf. Damit die
+        # hier angezeigten Transaktionen 1:1 mit der Gesamtperformance
+        # zusammenpassen, wird beides zusaetzlich nach CHF umgerechnet.
+        fx_series = get_fx_series(since_d, date.today(), base_currency, TARGET_CURRENCY)
+        for t in items:
+            d_str = str(t.get("date") or "")[:10]
+            try:
+                day = date.fromisoformat(d_str)
+            except ValueError:
+                day = date.today()
+            fx = fx_rate_on(fx_series, day, fallback=1.0)
+
+            total_base = t.get("totalInBaseCurrency")
+            total_incl_fees_base = t.get("totalPlusAllFeesInBaseCurrency")
+            if total_incl_fees_base is None:
+                total_incl_fees_base = total_base
+            fee_base = (
+                _num(total_base) - _num(total_incl_fees_base)
+                if total_base is not None and total_incl_fees_base is not None
+                else 0.0
+            )
+
+            t["feesBaseCurrency"] = round(fee_base, 4)
+            t["feesChf"] = round(fee_base * fx, 2)
+            t["totalChf"] = round(_num(total_base) * fx, 2) if total_base is not None else None
+            t["totalPlusFeesChf"] = (
+                round(_num(total_incl_fees_base) * fx, 2) if total_incl_fees_base is not None else None
+            )
+
+        return jsonify({
+            "fetchedAt": datetime.now().isoformat(),
+            "currency": TARGET_CURRENCY,
+            "baseCurrency": base_currency,
+            "transactions": items,
+        })
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler beim Abrufen der Transaktionen")
         return jsonify({"error": f"Fehler beim Abrufen der Transaktionen: {e}"}), 502
@@ -768,11 +839,18 @@ def _get_cash_and_deposits_history_chf(
     taeglich in CHF.
 
     Cash-Historie: letzter gemeldeter Saldo je Tag aus DEGIROs eigenen
-    'cashMovements'. Wird gegen den live abgefragten aktuellen Cash-Stand
-    geprueft; weicht der letzte rekonstruierte Wert stark davon ab, ist das
-    'balance'-Format vermutlich nicht so wie angenommen (nicht offiziell
-    dokumentiert) - dann leer zurueckgeben (Aufrufer faellt auf eine flache,
-    korrekte Linie zurueck).
+    'cashMovements'. Diese Rohsumme misst etwas anderes als das separat live
+    abgefragte "available to trade"-Guthaben (cashFunds) - z.B. reservierte /
+    noch nicht abgewickelte Betraege, Sollsalden in einer Fremdwaehrung o.ae.
+    Ein direkter Wertabgleich beider Groessen schlaegt deshalb strukturell
+    fast immer fehl, selbst wenn die Rekonstruktion an sich korrekt ist (das
+    war der Grund, warum diese Funktion vorher fuer dieses Konto dauerhaft
+    leer zurueckgab und die einzahlungsbereinigte %-Performance nie etwas
+    anzeigte). Statt bei Abweichung zu verwerfen, wird die rekonstruierte
+    Tag-zu-Tag-FORM beibehalten und die gesamte Serie um eine Konstante
+    verschoben, sodass sie am letzten bekannten Tag exakt dem live
+    abgefragten Wert entspricht - das verankert die Kurve korrekt, ohne die
+    relative Bewegung (aus der Ein-/Auszahlungen erkannt werden) zu verlieren.
 
     Netto-Einzahlungen: NICHT durch Klassifizieren einzelner Kontobuchungen
     bestimmt (zwei Anlaeufe damit - ueber 'type' geraten, dann ueber
@@ -809,26 +887,52 @@ def _get_cash_and_deposits_history_chf(
         logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
         movements = []
 
+    logger.info("cashMovements: %d Eintraege gefunden (seit %s)", len(movements), since_d.isoformat())
+
+    # Pro Tag koennen mehrere Buchungen vorliegen (Zinsen, Gebuehren, Trades,
+    # Ein-/Auszahlungen...); nicht jede davon traegt zwangslaeufig einen
+    # vollstaendigen 'balance'-Schnappschuss (manche Buchungstypen liefern
+    # dort vermutlich ein leeres/fehlendes Feld). Wird chronologisch einfach
+    # die LETZTE Buchung des Tages genommen, kann das zufaellig eine ohne
+    # Saldo sein, obwohl eine fruehere Buchung desselben Tages einen echten
+    # Saldo hatte - das ergab beobachtet einen rekonstruierten Saldo von
+    # exakt 0.00 an Tagen mit echter Kontoaktivitaet. Deshalb: je Tag die
+    # letzte Buchung MIT einem nicht-leeren balance-Feld bevorzugen, nur bei
+    # komplettem Fehlen eine balance-lose Buchung als Fallback nehmen.
     by_day_last: dict[str, dict] = {}
     for m in sorted(movements, key=lambda m: str(m.get("date") or "")):
         d = str(m.get("date") or "")[:10]
-        if d:
+        if not d:
+            continue
+        balance = m.get("balance")
+        if isinstance(balance, dict) and balance:
+            by_day_last[d] = m
+        elif d not in by_day_last:
             by_day_last[d] = m
 
     cash_result: dict[str, float] = {}
+    empty_balance_days = 0
     for d, movement in sorted(by_day_last.items()):
         balance = movement.get("balance") or {}
+        if not balance:
+            empty_balance_days += 1
         day = date.fromisoformat(d)
         cash_result[d] = sum(_to_chf(ccy, amount, day) for ccy, amount in balance.items())
+    if empty_balance_days:
+        logger.info(
+            "cashMovements: %d von %d Tagen ohne balance-Feld in irgendeiner Buchung dieses Tages",
+            empty_balance_days, len(by_day_last),
+        )
 
     if cash_result and live_cash_chf is not None:
-        last_value = cash_result[max(cash_result)]
-        if last_value <= 0 or abs(last_value - live_cash_chf) > max(200.0, live_cash_chf * 0.5):
-            logger.warning(
-                "Cash-Historie wirkt unplausibel (rekonstruiert=%.2f, live=%.2f) - verwende flachen aktuellen Wert",
-                last_value, live_cash_chf,
+        last_day = max(cash_result)
+        shift = live_cash_chf - cash_result[last_day]
+        if abs(shift) > 1e-6:
+            logger.info(
+                "Cash-Historie kalibriert: rekonstruiert(%s)=%.2f, live=%.2f, Verschiebung=%.2f",
+                last_day, cash_result[last_day], live_cash_chf, shift,
             )
-            cash_result = {}
+            cash_result = {d: v + shift for d, v in cash_result.items()}
 
     if not cash_result:
         return {}, {}
@@ -966,6 +1070,7 @@ def history_backfill():
             initial_price = price_series[min(price_series.keys())] if (usable and price_series) else fallback_price
 
             qty_running = 0.0
+            prev_qty = 0.0
             price_running = initial_price
             d = first_date
             while d <= date.today():
@@ -978,11 +1083,19 @@ def history_backfill():
                     # 5-fache vom letzten bekannten Kurs abweicht, ist praktisch
                     # immer ein Datenfehler (falsches Symbol, GBX/GBP-Verwechslung,
                     # Chart-Decoding) statt eine echte Kursbewegung - verwerfen.
-                    if price_running <= 0 or 0.2 <= (candidate / price_running) <= 5:
+                    # Ausnahme: direkt nach einer Phase mit 0 gehaltenen Stuecken
+                    # (Position komplett verkauft und spaeter neu gekauft) wird
+                    # IMMER frisch verankert - sonst kann ein waehrend der
+                    # Halte-Pause aufgetretener echter Kurssprung (Split, laengere
+                    # Erholung/Einbruch) faelschlich als Ausreisser verworfen
+                    # bleiben und den Kurs fuer die gesamte Historie nach dem
+                    # Wiedereinstieg dauerhaft auf dem alten Stand einfrieren.
+                    if prev_qty == 0 or price_running <= 0 or 0.2 <= (candidate / price_running) <= 5:
                         price_running = candidate
                 fx = fx_rate_on(fx_series, d, fallback=1.0)
                 value_chf = qty_running * price_running * fx
                 daily_value_chf[iso] = daily_value_chf.get(iso, 0.0) + value_chf
+                prev_qty = qty_running
                 d += timedelta(days=1)
 
             per_product_meta.append({

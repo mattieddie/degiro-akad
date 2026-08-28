@@ -291,6 +291,18 @@ function renderSummary(totals, fetchedAt) {
   el("stat-updated").textContent = fetchedAt ? new Date(fetchedAt).toLocaleString("de-CH") : "–";
 }
 
+function transactionsForProduct(productId) {
+  const cached = loadLocal(LS_KEYS.transactions, null);
+  const all = (cached && cached.transactions) || [];
+  return all
+    .filter((t) => String(t.productId) === String(productId))
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+}
+
+function totalFeesChfForProduct(productId) {
+  return transactionsForProduct(productId).reduce((sum, t) => sum + (t.feesChf || 0), 0);
+}
+
 function renderPositions(positions) {
   lastPositions = positions;
   el("panel-positions").classList.remove("hidden");
@@ -304,6 +316,7 @@ function renderPositions(positions) {
     const pl = p.plUnrealizedChf;
     const plClass = pl > 0 ? "pl-pos" : pl < 0 ? "pl-neg" : "";
     const plPctTxt = p.plUnrealizedPct !== null && p.plUnrealizedPct !== undefined ? ` (${p.plUnrealizedPct.toFixed(1)}%)` : "";
+    const feesChf = totalFeesChfForProduct(p.productId);
 
     tr.innerHTML = `
       <td>${p.name ?? p.productId}</td>
@@ -313,6 +326,7 @@ function renderPositions(positions) {
       <td>${fmtChf(p.valueChf)}</td>
       <td>${share.toFixed(1)}%</td>
       <td>${fmtNative(p.averagePrice, p.currency)}</td>
+      <td>${fmtChf(feesChf)}</td>
       <td class="${plClass}">${pl !== undefined && pl !== null ? fmtChf(pl) + plPctTxt : "–"}</td>
     `;
     tr.addEventListener("click", () => openPositionModal(p));
@@ -334,7 +348,8 @@ function renderTransactions(transactions) {
       <td>${t.buysell ?? "–"}</td>
       <td>${t.quantity ?? "–"}</td>
       <td>${t.price ?? "–"}</td>
-      <td>${t.total ?? "–"}</td>
+      <td>${fmtChf(t.feesChf)}</td>
+      <td>${fmtChf(t.totalPlusFeesChf)}</td>
     `;
     tbody.appendChild(tr);
   }
@@ -466,6 +481,28 @@ function setModalRangeButtons() {
 function openModal() { el("modal-overlay").classList.remove("hidden"); }
 function closeModal() { el("modal-overlay").classList.add("hidden"); }
 
+function renderModalTransactions(productId) {
+  const forPosition = transactionsForProduct(productId);
+
+  const totalFeesChf = totalFeesChfForProduct(productId);
+  el("modal-fees").textContent = forPosition.length ? fmtChf(totalFeesChf) : "–";
+
+  const tbody = document.querySelector("#table-modal-transactions tbody");
+  tbody.innerHTML = "";
+  for (const t of forPosition) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${t.date ? new Date(t.date).toLocaleDateString("de-CH") : "–"}</td>
+      <td>${t.buysell ?? "–"}</td>
+      <td>${t.quantity ?? "–"}</td>
+      <td>${t.price ?? "–"}</td>
+      <td>${fmtChf(t.feesChf)}</td>
+      <td>${fmtChf(t.totalPlusFeesChf)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
 async function openPositionModal(position) {
   modalMode = "value";
   modalRange = "MAX";
@@ -482,6 +519,7 @@ async function openPositionModal(position) {
   modalPlEl.textContent = position.plUnrealizedChf !== null && position.plUnrealizedChf !== undefined ? fmtChf(position.plUnrealizedChf) + plPctTxt : "–";
   modalPlEl.className = "stat-value small " + (position.plUnrealizedChf > 0 ? "pl-pos" : position.plUnrealizedChf < 0 ? "pl-neg" : "");
   el("modal-verify-note").textContent = "Lade Kursverlauf...";
+  renderModalTransactions(position.productId);
   setModalModeButtons();
   setModalRangeButtons();
   openModal();
