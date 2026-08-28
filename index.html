@@ -15,19 +15,13 @@
 
 <main>
   <section id="panel-connect" class="card">
-    <h2>Verbindung zum lokalen Proxy</h2>
-    <p class="hint">
-      Alle Daten bleiben ausschliesslich in deinem Browser (localStorage) und auf deinem Rechner.
-      Es wird nichts an GitHub gesendet. Starte zuerst den lokalen Proxy
-      (<code>local-proxy/proxy.py</code>) und trage unten das beim Start angezeigte Proxy-Token ein.
-    </p>
-    <div class="grid">
-      <label>Proxy-Adresse
-        <input id="input-proxy-url" type="text" placeholder="http://127.0.0.1:8765" />
-      </label>
-      <label>Proxy-Token
-        <input id="input-proxy-token" type="password" placeholder="beim Start des Proxys angezeigt" />
-      </label>
+    <h2>Mit DEGIRO verbinden</h2>
+  <p class="hint">
+  Die Verbindung läuft sicher über das Backend. Deine DEGIRO-Sitzung wird dort serverseitig verwaltet;
+  im Browser muss kein Proxy-Token eingegeben werden.
+  </p>
+  <div class="grid">
+
       <label>DEGIRO-Benutzername
         <input id="input-username" type="text" autocomplete="username" />
       </label>
