@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import secrets
 import time
 from datetime import date, datetime, timedelta
@@ -59,6 +60,13 @@ FX_SERIES_CACHE: dict[tuple, dict[str, float]] = {}
 CHART_CACHE: dict[tuple, dict] = {}
 
 TARGET_CURRENCY = "CHF"
+
+# Optionale dritte Kursquelle (nach DEGIRO und Yahoo). Wird NUR aus der
+# Umgebungsvariable gelesen - der Key wird hier absichtlich nie hartcodiert
+# oder sonst irgendwo abgelegt. Setze ihn vor dem Start selbst, z.B.:
+#   PowerShell:  $env:FMP_API_KEY = "dein-key"; python proxy.py
+#   bash:        FMP_API_KEY=dein-key python proxy.py
+FMP_API_KEY = os.environ.get("FMP_API_KEY")
 
 # Wird beim Start einmalig erzeugt und in der Konsole ausgegeben. Die Seite
 # muss dieses Token kennen, um den Proxy ansprechen zu duerfen.
@@ -319,6 +327,61 @@ def fetch_yahoo_daily_close_series(isin: str | None, fallback_symbol: str | None
     return result_tuple
 
 
+def fmp_resolve_symbol(isin: str | None) -> str | None:
+    if not FMP_API_KEY or not isin:
+        return None
+    try:
+        resp = requests.get(
+            "https://financialmodelingprep.com/stable/search-isin",
+            params={"isin": isin, "apikey": FMP_API_KEY},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data[0].get("symbol") or data[0].get("ticker")
+    except Exception:  # noqa: BLE001
+        logger.warning("FMP-ISIN-Suche fuer %s fehlgeschlagen", isin, exc_info=True)
+    return None
+
+
+def fetch_fmp_daily_close_series(isin: str | None, since_d: date) -> tuple[dict[str, float], str | None]:
+    """Liefert (Serie {ISO-Datum: Schlusskurs}, Waehrung falls von FMP gemeldet)."""
+    if not FMP_API_KEY:
+        return {}, None
+    symbol = fmp_resolve_symbol(isin)
+    if not symbol:
+        return {}, None
+
+    cache_key = ("fmp", symbol, since_d.isoformat())
+    if cache_key in CHART_CACHE:
+        return CHART_CACHE[cache_key]
+
+    series_map: dict[str, float] = {}
+    currency = None
+    try:
+        resp = requests.get(
+            "https://financialmodelingprep.com/stable/historical-price-eod/full",
+            params={"symbol": symbol, "from": since_d.isoformat(), "to": date.today().isoformat(), "apikey": FMP_API_KEY},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        rows = data.get("historical") if isinstance(data, dict) else data
+        for row in rows or []:
+            d = row.get("date")
+            c = row.get("close")
+            if d and c is not None:
+                series_map[str(d)[:10]] = float(c)
+    except Exception:  # noqa: BLE001
+        logger.warning("FMP-Kursdaten fuer Symbol=%s nicht abrufbar", symbol, exc_info=True)
+        series_map = {}
+
+    result = (series_map, currency)
+    CHART_CACHE[cache_key] = result
+    return result
+
+
 def resolve_price_series(
     user_token: int,
     vwd_id: str | None,
@@ -332,12 +395,13 @@ def resolve_price_series(
     """
     Liefert (Serie, Quelle, verifiziert, Waehrung_der_Serie). Reihenfolge:
     1. DEGIRO-Kurschart, falls gegen DEGIROs eigenen Schlusskurs verifizierbar.
-    2. Yahoo Finance (oeffentlich, ueber ISIN aufgeloest), falls DEGIRO nicht
-       verifizierbar ist - mit etwas grosszuegigerer Toleranz, da
-       unterschiedliche Datenanbieter leicht abweichende Schlusskurse melden
-       koennen.
-    3. Letzter unverifizierter DEGIRO-Versuch, falls vorhanden.
-    4. Nichts gefunden.
+    2. Yahoo Finance (oeffentlich, ueber ISIN aufgeloest), falls verifizierbar.
+    3. Financial Modeling Prep (nur falls FMP_API_KEY gesetzt), falls verifizierbar.
+    4. Letzter unverifizierter Versuch (DEGIRO oder Yahoo) nur zu Info-Zwecken -
+       wird vom Aufrufer wegen usable=verified NICHT fuer echte Werte benutzt.
+    5. Nichts gefunden.
+    Bei 2. und 3. wird eine etwas grosszuegigere Toleranz verwendet, da
+    unterschiedliche Datenanbieter leicht abweichende Schlusskurse melden koennen.
     """
     degiro_series: dict[str, float] = {}
     if vwd_id:
@@ -346,12 +410,18 @@ def resolve_price_series(
             return degiro_series, "degiro", True, currency
 
     yahoo_series, yahoo_ccy = fetch_yahoo_daily_close_series(isin, symbol, since_d)
-    if yahoo_series:
-        yahoo_verified = verify_series(yahoo_series, close_price, close_price_date, tolerance_pct=0.03)
-        return yahoo_series, "yahoo", yahoo_verified, (yahoo_ccy or currency)
+    if yahoo_series and verify_series(yahoo_series, close_price, close_price_date, tolerance_pct=0.03):
+        return yahoo_series, "yahoo", True, (yahoo_ccy or currency)
+
+    if FMP_API_KEY:
+        fmp_series, fmp_ccy = fetch_fmp_daily_close_series(isin, since_d)
+        if fmp_series and verify_series(fmp_series, close_price, close_price_date, tolerance_pct=0.03):
+            return fmp_series, "fmp", True, (fmp_ccy or currency)
 
     if degiro_series:
         return degiro_series, "degiro", False, currency
+    if yahoo_series:
+        return yahoo_series, "yahoo", False, (yahoo_ccy or currency)
 
     return {}, "none", False, currency
 
@@ -798,8 +868,10 @@ def history_backfill():
             running = 0.0
             for t in sorted(txs, key=lambda x: str(x.get("date"))):
                 d = str(t.get("date"))[:10]
-                signed_qty = _num(t.get("quantity")) * (1 if t.get("buysell") == "B" else -1)
-                running += signed_qty
+                # DEGIROs "quantity" ist bereits vorzeichenbehaftet (negativ bei
+                # Verkauf) - NICHT zusaetzlich ueber buysell umdrehen, sonst wird
+                # ein Verkauf faelschlich als weiterer Kauf gezaehlt.
+                running += _num(t.get("quantity"))
                 qty_by_day[d] = running
 
             price_series, source, verified, series_currency = resolve_price_series(
@@ -869,7 +941,7 @@ def history_backfill():
             "since": earliest.isoformat(),
             "series": series,
             "positions": per_product_meta,
-            "note": "used=true: echter Kursverlauf verwendet (source=degiro: DEGIRO-Kurschart; source=yahoo: DEGIRO nicht verifizierbar, Yahoo Finance stattdessen erfolgreich verifiziert). used=false: kein verifizierter Kursverlauf gefunden, es wird ein Naeherungswert (letzter bekannter Kurs, flach) verwendet. netDepositsChf: kumulierte Netto-Einzahlungen (Basis der einzahlungsbereinigten %-Performance).",
+            "note": "used=true: echter Kursverlauf verwendet (source=degiro/yahoo/fmp, jeweils gegen DEGIROs Schlusskurs verifiziert). used=false: kein verifizierter Kursverlauf gefunden, es wird ein Naeherungswert (letzter bekannter Kurs, flach) verwendet. netDepositsChf: kumulierte Netto-Einzahlungen (Basis der einzahlungsbereinigten %-Performance).",
         })
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler bei der Historien-Rekonstruktion")
@@ -921,6 +993,7 @@ def position_history():
             notes = {
                 "degiro": "Kursverlauf von DEGIRO, gegen den gemeldeten Schlusskurs validiert.",
                 "yahoo": "DEGIROs Kurschart war nicht verfuegbar/verifizierbar - Kursdaten stattdessen von Yahoo Finance bezogen und erfolgreich validiert.",
+                "fmp": "DEGIRO und Yahoo Finance nicht verifizierbar - Kursdaten stattdessen von Financial Modeling Prep bezogen und erfolgreich validiert.",
             }
             note = notes[source]
         else:
@@ -1064,6 +1137,7 @@ def main():
     print("=" * 70)
     print(" DEGIRO-Proxy laeuft lokal. Nichts wird gespeichert oder an GitHub gesendet.")
     print(" Waehrungsumrechnung nach CHF via api.frankfurter.app (oeffentliche EZB-Kurse).")
+    print(f" Kursquellen: DEGIRO, Yahoo Finance, Financial Modeling Prep ({'aktiv' if FMP_API_KEY else 'kein FMP_API_KEY gesetzt - uebersprungen'})")
     print(f" Erlaubte Herkunft(en): {', '.join(ALLOWED_ORIGINS)}")
     print(f" Proxy-Token (in der Webseite eintragen): {PROXY_TOKEN}")
     print(f" Adresse: http://127.0.0.1:{args.port}")

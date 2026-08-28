@@ -51,6 +51,31 @@ Webseite. Falls dein GitHub-Pages-Link anders lautet als
 python proxy.py --origin https://<dein-nutzername>.github.io
 ```
 
+**Optional: Financial Modeling Prep als dritte Kursquelle.** Falls DEGIRO
+und Yahoo Finance für eine Position keinen verifizierbaren Kursverlauf
+liefern, kann der Proxy zusätzlich [Financial Modeling
+Prep](https://financialmodelingprep.com/) (ISIN-Suche + historische
+EOD-Kurse, kostenloser Plan reicht) versuchen. Dafür einen API-Key auf
+financialmodelingprep.com erstellen und **selbst** als Umgebungsvariable
+setzen, bevor `proxy.py` startet – der Key wird nirgends im Code oder in
+einer Datei abgelegt, nur zur Laufzeit aus der Umgebungsvariable gelesen:
+
+```powershell
+# PowerShell
+$env:FMP_API_KEY = "dein-key"
+python proxy.py
+```
+
+```bash
+# bash
+FMP_API_KEY=dein-key python proxy.py
+```
+
+Ohne gesetzte Variable wird diese Quelle einfach übersprungen (siehe
+Konsolenausgabe beim Start). Falls du versehentlich einen Key im Klartext
+irgendwo geteilt hast (z.B. in einem Chat), empfiehlt es sich, ihn bei
+Financial Modeling Prep zu regenerieren.
+
 ### 2. Webseite öffnen
 
 Öffne https://mattieddie.github.io/degiro-akad/ (oder lokal via
@@ -205,6 +230,11 @@ Preis-Toleranz selbst aufzuweichen).
   nicht verfügbar/verifizierbar ist. Übertragen werden dabei ISIN bzw.
   Symbol des jeweiligen Produkts (öffentliche Marktdaten-Endpunkte, keine
   Authentifizierung, keine Konto- oder Login-Daten).
+- **Financial Modeling Prep** (optional, nur falls `FMP_API_KEY` gesetzt
+  ist): wird nur kontaktiert, wenn weder DEGIRO noch Yahoo einen
+  verifizierbaren Kursverlauf liefern. Übertragen werden ISIN/Symbol und
+  dein FMP-API-Key (an FMP, nicht an GitHub oder sonst wo) – keine Konto-
+  oder Login-Daten.
 - Dies ist **keine Anlageberatung** und keine offizielle DEGIRO-Anwendung.
 
 ## Lokale Daten löschen

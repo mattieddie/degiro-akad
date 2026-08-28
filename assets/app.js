@@ -243,10 +243,12 @@ function buildHistoryNoteText(positions) {
   if (!positions || !positions.length) return "";
   const degiro = positions.filter((p) => p.used && p.source === "degiro").length;
   const yahoo = positions.filter((p) => p.used && p.source === "yahoo").length;
+  const fmp = positions.filter((p) => p.used && p.source === "fmp").length;
   const none = positions.filter((p) => !p.used).length;
   const parts = [];
   if (degiro) parts.push(`${degiro} mit echtem Verlauf von DEGIRO`);
-  if (yahoo) parts.push(`${yahoo} mit echtem Verlauf von Yahoo Finance (DEGIRO nicht verifizierbar)`);
+  if (yahoo) parts.push(`${yahoo} mit echtem Verlauf von Yahoo Finance`);
+  if (fmp) parts.push(`${fmp} mit echtem Verlauf von Financial Modeling Prep`);
   if (none) parts.push(`${none} ohne verifizierten Kursverlauf (Näherung, letzter bekannter Kurs, flach)`);
   return `Kursquellen: ${parts.join(", ")}.`;
 }
