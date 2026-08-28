@@ -140,17 +140,54 @@ function mergeHistorySeries(backfill, organic) {
 
 function filterByRange(series, range) {
   if (!series.length || range === "MAX") return series;
-  const end = new Date(series[series.length - 1].date + "T00:00:00");
+  // Reine "YYYY-MM-DD"-Strings werden von Date() als UTC-Mitternacht geparst;
+  // ab hier durchgehend UTC-Getter/Setter verwenden, sonst verschiebt sich der
+  // Zeitraum je nach Zeitzone des Betrachters um einen Tag.
+  const end = new Date(series[series.length - 1].date);
   const cutoff = new Date(end);
-  if (range === "1D") cutoff.setDate(cutoff.getDate() - 1);
-  else if (range === "1W") cutoff.setDate(cutoff.getDate() - 7);
-  else if (range === "1M") cutoff.setMonth(cutoff.getMonth() - 1);
-  else if (range === "3M") cutoff.setMonth(cutoff.getMonth() - 3);
-  else if (range === "6M") cutoff.setMonth(cutoff.getMonth() - 6);
-  else if (range === "1Y") cutoff.setFullYear(cutoff.getFullYear() - 1);
-  else if (range === "YTD") { cutoff.setMonth(0); cutoff.setDate(1); }
+  if (range === "1D") cutoff.setUTCDate(cutoff.getUTCDate() - 1);
+  else if (range === "1W") cutoff.setUTCDate(cutoff.getUTCDate() - 7);
+  else if (range === "1M") cutoff.setUTCMonth(cutoff.getUTCMonth() - 1);
+  else if (range === "3M") cutoff.setUTCMonth(cutoff.getUTCMonth() - 3);
+  else if (range === "6M") cutoff.setUTCMonth(cutoff.getUTCMonth() - 6);
+  else if (range === "1Y") cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 1);
+  else if (range === "YTD") { cutoff.setUTCMonth(0); cutoff.setUTCDate(1); }
   const cutoffIso = cutoff.toISOString().slice(0, 10);
   return series.filter((p) => p.date >= cutoffIso);
+}
+
+function computeRebasedPerformance(series) {
+  // G(t) = (Depotwert - kumulierte Netto-Einzahlungen) / kumulierte Netto-Einzahlungen.
+  // Das ist bereits einzahlungsbereinigt (eine Einzahlung + Kauf veraendert G
+  // nicht sprunghaft). Fuer die Anzeige wird die Kurve zusaetzlich relativ
+  // zum ersten Punkt im gewaehlten Zeitraum reskaliert, damit sie dort IMMER
+  // bei 0% beginnt - ohne die Einzahlungsbereinigung zu verlieren (analog zu
+  // einer verketteten Zeitgewichteten Rendite zwischen zwei Zeitpunkten).
+  const g = series.map((h) => {
+    if (h.netDeposits === null || h.netDeposits === undefined || h.netDeposits <= 0) return null;
+    if (h.equity === null || h.equity === undefined) return null;
+    return (h.equity - h.netDeposits) / h.netDeposits;
+  });
+  const baseIdx = g.findIndex((v) => v !== null);
+  if (baseIdx === -1) return series.map(() => null);
+  const base = 1 + g[baseIdx];
+  return g.map((v) => (v === null ? null : ((1 + v) / base - 1) * 100));
+}
+
+function updatePerfBadge(pctSeries) {
+  const badge = el("chart-perf-badge");
+  let last = null;
+  for (let i = pctSeries.length - 1; i >= 0; i--) {
+    if (pctSeries[i] !== null && pctSeries[i] !== undefined) { last = pctSeries[i]; break; }
+  }
+  if (last === null) {
+    badge.textContent = "";
+    badge.className = "perf-badge";
+    return;
+  }
+  const sign = last > 0 ? "+" : "";
+  badge.textContent = `${sign}${last.toFixed(2)}%`;
+  badge.className = "perf-badge " + (last > 0 ? "perf-pos" : last < 0 ? "perf-neg" : "");
 }
 
 function renderChart(fullSeries) {
@@ -158,19 +195,14 @@ function renderChart(fullSeries) {
   const series = filterByRange(fullSeries, currentRange);
   const ctx = el("chart-history").getContext("2d");
   const labels = series.map((h) => h.date);
+  const rebasedPct = computeRebasedPerformance(series);
+  updatePerfBadge(rebasedPct);
 
   if (historyChart) historyChart.destroy();
 
   if (currentMode === "percent") {
-    el("chart-title").textContent = "Performance seit Kauf, einzahlungsbereinigt (%)";
-    // (Depotwert - kumulierte Netto-Einzahlungen) / kumulierte Netto-Einzahlungen.
-    // Dadurch zaehlt eine Einzahlung plus Aktienkauf NICHT als Performance -
-    // nur die tatsaechliche Wertentwicklung ab dem jeweiligen Kaufzeitpunkt.
-    const pct = series.map((h) => {
-      if (h.netDeposits === null || h.netDeposits === undefined || h.netDeposits <= 0) return null;
-      if (h.equity === null || h.equity === undefined) return null;
-      return ((h.equity - h.netDeposits) / h.netDeposits) * 100;
-    });
+    el("chart-title").textContent = "Performance seit Range-Start, einzahlungsbereinigt (%)";
+    const pct = rebasedPct;
     historyChart = new Chart(ctx, {
       type: "line",
       data: {

@@ -163,6 +163,16 @@ th { color: var(--text-muted); font-weight: 500; }
 }
 .checkbox-label input { cursor: pointer; }
 
+.perf-badge {
+  font-weight: 700;
+  font-size: 0.95rem;
+  padding: 0.2rem 0.65rem;
+  border-radius: 6px;
+  color: var(--text-muted);
+}
+.perf-badge.perf-pos { color: var(--green); background: rgba(53, 201, 143, 0.12); }
+.perf-badge.perf-neg { color: var(--red); background: rgba(255, 92, 108, 0.12); }
+
 .tag {
   display: inline-block;
   font-size: 0.7rem;

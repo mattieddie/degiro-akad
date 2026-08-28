@@ -125,11 +125,13 @@ Wählbare Zeiträume (1T/1W/1M/3M/6M/1J/YTD/Max) filtern diese kombinierte
 Serie clientseitig. Da nur Tageswerte (kein Intraday) erfasst werden, zeigt
 „1T“ entsprechend wenig Auflösung.
 
-Über die Buttons „Wert (CHF)“ / „Performance (%)“ lässt sich zwischen
-absoluter Wertdarstellung und einzahlungsbereinigter Performance umschalten:
+Über der Grafik zeigt ein farbiges Badge (grün/rot) die Performance des
+aktuell gewählten Zeitraums. Über die Buttons „Wert (CHF)“ / „Performance
+(%)“ lässt sich zwischen absoluter Wertdarstellung und einzahlungsbereinigter
+Performance umschalten. Beide beruhen auf:
 
 ```
-Performance(%) = (Depotwert − kumulierte Netto-Einzahlungen) / kumulierte Netto-Einzahlungen
+G(t) = (Depotwert(t) − kumulierte Netto-Einzahlungen(t)) / kumulierte Netto-Einzahlungen(t)
 ```
 
 Kumulierte Netto-Einzahlungen sind die laufende Summe aller Kontobuchungen
@@ -138,8 +140,13 @@ Buchungen **mit** `productId` (Handel, Dividenden, Zinsen auf eine Position)
 zählen bewusst nicht dazu. Zahlst du Geld ein und kaufst davon Aktien,
 steigt der Nenner sofort mit, der Zähler (Depotwert) aber erst durch
 tatsächliche Kursgewinne – eine Einzahlung erzeugt also keinen künstlichen
-Sprung nach oben, sondern höchstens eine kurze Verwässerung, bis sich die
-neu gekauften Positionen entwickeln.
+Sprung nach oben, sondern höchstens eine kurze Verwässerung.
+
+Die Prozentkurve **beginnt immer bei 0% am Start des gewählten Zeitraums**:
+angezeigt wird `((1+G(t)) / (1+G(Range-Start)) − 1) × 100`, also die
+verkettete Rendite zwischen Range-Start und t auf Basis der bereits
+einzahlungsbereinigten Kurve G – so bleibt sowohl "0% am Anfang" als auch
+"Einzahlungen verzerren nicht" gleichzeitig erfüllt.
 
 ## Positions-Detailansicht
 
