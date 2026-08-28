@@ -19,6 +19,7 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import secrets
@@ -809,6 +810,13 @@ def _get_cash_and_deposits_history_chf(
         logger.warning("Kontoauszug (cashMovements) nicht abrufbar", exc_info=True)
         movements = []
 
+    # Diagnose: bisher wurde die Cash-Rekonstruktion aus 'balance' fuer dieses
+    # Konto konsequent verworfen. Bevor hier weiter geraten wird, einmal die
+    # tatsaechliche Rohstruktur ins Log schreiben (Konsole von proxy.py).
+    logger.info("cashMovements: %d Eintraege gefunden", len(movements))
+    for m in movements[:3]:
+        logger.info("  Beispiel-Buchung: %s", json.dumps(m, default=str, ensure_ascii=False))
+
     by_day_last: dict[str, dict] = {}
     for m in sorted(movements, key=lambda m: str(m.get("date") or "")):
         d = str(m.get("date") or "")[:10]
@@ -830,8 +838,17 @@ def _get_cash_and_deposits_history_chf(
             )
             cash_result = {}
 
+    # WICHTIG: die Netto-Einzahlungs-Herleitung (weiter unten) braucht die
+    # ECHTE taegliche Cash-Historie. Ein flacher Naeherungswert als Ersatz
+    # wurde hier testweise versucht und war nachweislich falsch: er erzeugt
+    # an jedem Handelstag eine scheinbare "Einzahlung" in Hoehe des
+    # Handels-Cashflows (da ein konstanter Cash-Stand + ein negativer
+    # Handels-Cashflow rechnerisch wie eine Einzahlung aussieht), reproduziert
+    # also die urspruengliche Verzerrung nur in neuer Form. Daher hier bewusst
+    # KEIN Fallback: ohne verlaessliche Cash-Historie lieber keine
+    # Netto-Einzahlungs-Kurve zeigen als eine falsche.
     if not cash_result:
-        return {}, {}
+        return cash_result, {}
 
     trade_cashflow_by_day: dict[str, float] = {}
     running = 0.0
