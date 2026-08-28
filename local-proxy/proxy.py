@@ -70,11 +70,9 @@ TARGET_CURRENCY = "CHF"
 #   bash:        FMP_API_KEY=dein-key python proxy.py
 FMP_API_KEY = os.environ.get("FMP_API_KEY")
 
-# Serverseitige Sitzungen bleiben nur im Speicher dieser laufenden Instanz.
-# Der Browser erhält ausschließlich eine HttpOnly-Cookie-ID, nie ein Backend-Token.
-SESSION_STORE: dict[str, dict] = {}
-SESSION_COOKIE = "degiro_session"
-SESSION_MAX_AGE = 60 * 60 * 12
+# Wird beim Start einmalig erzeugt und in der Konsole ausgegeben. Die Seite
+# muss dieses Token kennen, um den Proxy ansprechen zu duerfen.
+PROXY_TOKEN = secrets.token_urlsafe(24)
 
 ALLOWED_ORIGINS: list[str] = []
 
@@ -482,12 +480,10 @@ def resolve_price_series(
 def require_auth(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        session_id = request.cookies.get(SESSION_COOKIE, "")
-        session = SESSION_STORE.get(session_id)
-        if not session_id or session is None:
-            return jsonify({"error": "Backend-Sitzung fehlt oder ist abgelaufen"}), 401
-        SESSION.clear()
-        SESSION.update(session)
+        auth = request.headers.get("Authorization", "")
+        token = auth.removeprefix("Bearer ").strip()
+        if not secrets.compare_digest(token, PROXY_TOKEN):
+            return jsonify({"error": "Ungueltiges oder fehlendes Proxy-Token"}), 401
         return fn(*args, **kwargs)
 
     return wrapper
@@ -509,9 +505,8 @@ def add_cors_headers(response):
     if origin and origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Vary"] = "Origin"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
 
@@ -536,6 +531,11 @@ def health():
 
 @app.route("/api/login", methods=["POST"])
 def login():
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if not secrets.compare_digest(token, PROXY_TOKEN):
+        return jsonify({"error": "Ungueltiges oder fehlendes Proxy-Token"}), 401
+
     body = request.get_json(silent=True) or {}
     username = body.get("username")
     password = body.get("password")
@@ -573,19 +573,8 @@ def login():
         if fmp_api_key:
             SESSION["fmp_api_key"] = fmp_api_key
 
-        session_id = secrets.token_urlsafe(32)
-        SESSION_STORE[session_id] = SESSION.copy()
         logger.info("Login erfolgreich (int_account=%s, base_currency=%s)", int_account, SESSION["base_currency"])
-        response = jsonify({"success": True, "baseCurrency": SESSION["base_currency"]})
-        response.set_cookie(
-            SESSION_COOKIE,
-            session_id,
-            max_age=SESSION_MAX_AGE,
-            httponly=True,
-            secure=True,
-            samesite="Lax",
-        )
-        return response
+        return jsonify({"success": True, "baseCurrency": SESSION["base_currency"]})
     except DeGiroConnectionError as e:
         logger.warning("DEGIRO-Loginfehler: %s", e)
         return jsonify({"error": f"DEGIRO-Loginfehler: {e}"}), 401
@@ -621,8 +610,6 @@ def _connect_with_in_app_wait(trading_api: TradingAPI, max_wait_seconds: int = 9
 @app.route("/api/logout", methods=["POST"])
 @require_auth
 def logout():
-    session_id = request.cookies.get(SESSION_COOKIE, "")
-    SESSION_STORE.pop(session_id, None)
     trading_api = SESSION.get("trading_api")
     if trading_api is not None:
         try:
@@ -1246,6 +1233,7 @@ def main():
     print(" Waehrungsumrechnung nach CHF via api.frankfurter.app (oeffentliche EZB-Kurse).")
     print(f" Kursquellen: DEGIRO, Yahoo Finance, Financial Modeling Prep ({'aktiv' if FMP_API_KEY else 'kein FMP_API_KEY gesetzt - uebersprungen'})")
     print(f" Erlaubte Herkunft(en): {', '.join(ALLOWED_ORIGINS)}")
+    print(f" Proxy-Token (in der Webseite eintragen): {PROXY_TOKEN}")
     print(f" Adresse: http://127.0.0.1:{args.port}")
     print(" Beenden mit Strg+C")
     print("=" * 70)
