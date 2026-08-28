@@ -28,6 +28,7 @@ const LS_KEYS = {
   positionHistory: "degiro_position_history",
   closedPositions: "degiro_closed_positions",
   showClosed: "degiro_show_closed",
+  fmpKey: "degiro_fmp_key",
 };
 
 const RANGE_ORDER = ["1D", "1W", "1M", "3M", "6M", "1Y", "YTD", "MAX"];
@@ -532,6 +533,7 @@ async function connectAndLoad() {
   const username = el("input-username").value.trim();
   const password = el("input-password").value;
   const totp = el("input-totp").value.trim();
+  const fmpKey = el("input-fmp-key").value.trim();
 
   if (!proxyToken()) {
     setMessage("Bitte das Proxy-Token eintragen (wird beim Start von proxy.py angezeigt).", "error");
@@ -548,12 +550,13 @@ async function connectAndLoad() {
   try {
     await proxyFetch("/api/login", {
       method: "POST",
-      body: JSON.stringify({ username, password, totp_secret_key: totp || undefined }),
+      body: JSON.stringify({ username, password, totp_secret_key: totp || undefined, fmp_api_key: fmpKey || undefined }),
     });
 
     saveLocal(LS_KEYS.proxyUrl, proxyUrl());
     saveLocal(LS_KEYS.proxyToken, proxyToken());
     saveLocal(LS_KEYS.username, username);
+    if (fmpKey) saveLocal(LS_KEYS.fmpKey, fmpKey);
     el("input-password").value = "";
 
     setOnlineBadge(true);
@@ -628,6 +631,7 @@ function restoreInputsFromCache() {
   el("input-proxy-url").value = loadLocal(LS_KEYS.proxyUrl, "http://127.0.0.1:8765");
   el("input-proxy-token").value = loadLocal(LS_KEYS.proxyToken, "");
   el("input-username").value = loadLocal(LS_KEYS.username, "");
+  el("input-fmp-key").value = loadLocal(LS_KEYS.fmpKey, "");
 }
 
 el("btn-connect").addEventListener("click", connectAndLoad);

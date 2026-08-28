@@ -53,6 +53,7 @@ SESSION: dict = {
     "user_token": None,
     "base_currency": None,
     "logged_in_at": None,
+    "fmp_api_key": None,
 }
 
 # Nur fuer die Dauer des laufenden Prozesses im RAM - kein Zugriff auf Disk.
@@ -327,13 +328,23 @@ def fetch_yahoo_daily_close_series(isin: str | None, fallback_symbol: str | None
     return result_tuple
 
 
+def get_fmp_api_key() -> str | None:
+    """
+    Beim Verbinden ueber die Webseite eingegebener Key (nur im RAM, pro
+    Sitzung) hat Vorrang; sonst Fallback auf die Umgebungsvariable
+    FMP_API_KEY, falls beim Start von proxy.py gesetzt.
+    """
+    return SESSION.get("fmp_api_key") or FMP_API_KEY
+
+
 def fmp_resolve_symbol(isin: str | None) -> str | None:
-    if not FMP_API_KEY or not isin:
+    api_key = get_fmp_api_key()
+    if not api_key or not isin:
         return None
     try:
         resp = requests.get(
             "https://financialmodelingprep.com/stable/search-isin",
-            params={"isin": isin, "apikey": FMP_API_KEY},
+            params={"isin": isin, "apikey": api_key},
             timeout=10,
         )
         resp.raise_for_status()
@@ -347,7 +358,8 @@ def fmp_resolve_symbol(isin: str | None) -> str | None:
 
 def fetch_fmp_daily_close_series(isin: str | None, since_d: date) -> tuple[dict[str, float], str | None]:
     """Liefert (Serie {ISO-Datum: Schlusskurs}, Waehrung falls von FMP gemeldet)."""
-    if not FMP_API_KEY:
+    api_key = get_fmp_api_key()
+    if not api_key:
         return {}, None
     symbol = fmp_resolve_symbol(isin)
     if not symbol:
@@ -362,7 +374,7 @@ def fetch_fmp_daily_close_series(isin: str | None, since_d: date) -> tuple[dict[
     try:
         resp = requests.get(
             "https://financialmodelingprep.com/stable/historical-price-eod/full",
-            params={"symbol": symbol, "from": since_d.isoformat(), "to": date.today().isoformat(), "apikey": FMP_API_KEY},
+            params={"symbol": symbol, "from": since_d.isoformat(), "to": date.today().isoformat(), "apikey": api_key},
             timeout=15,
         )
         resp.raise_for_status()
@@ -418,7 +430,7 @@ def resolve_price_series(
         verified = verify_series(yahoo_series, close_price, close_price_date, tolerance_pct=0.03)
         return yahoo_series, "yahoo", verified, (yahoo_ccy or currency)
 
-    if FMP_API_KEY:
+    if get_fmp_api_key():
         fmp_series, fmp_ccy = fetch_fmp_daily_close_series(isin, since_d)
         if fmp_series:
             verified = verify_series(fmp_series, close_price, close_price_date, tolerance_pct=0.03)
@@ -477,6 +489,7 @@ def health():
         "logged_in_at": SESSION["logged_in_at"],
         "baseCurrency": SESSION["base_currency"],
         "targetCurrency": TARGET_CURRENCY,
+        "fmpConfigured": bool(get_fmp_api_key()),
     })
 
 
@@ -492,6 +505,7 @@ def login():
     password = body.get("password")
     totp_secret_key = body.get("totp_secret_key") or None
     one_time_password = body.get("one_time_password") or None
+    fmp_api_key = body.get("fmp_api_key") or None
 
     if not username or not password:
         return jsonify({"error": "username und password sind erforderlich"}), 400
@@ -516,6 +530,12 @@ def login():
         SESSION["user_token"] = user_token
         SESSION["base_currency"] = detect_base_currency(client_details)
         SESSION["logged_in_at"] = datetime.now().isoformat()
+        # Nur im RAM fuer die Dauer dieser Sitzung - nie auf Platte geschrieben.
+        # Ueberschreibt bewusst nicht mit None, falls dieses Login-Formular
+        # ohne Key abgeschickt wurde, aber vorher schon einer per Umgebungs-
+        # variable galt (siehe get_fmp_api_key()).
+        if fmp_api_key:
+            SESSION["fmp_api_key"] = fmp_api_key
 
         logger.info("Login erfolgreich (int_account=%s, base_currency=%s)", int_account, SESSION["base_currency"])
         return jsonify({"success": True, "baseCurrency": SESSION["base_currency"]})
@@ -562,7 +582,7 @@ def logout():
             pass
     SESSION.update({
         "trading_api": None, "int_account": None, "user_token": None,
-        "base_currency": None, "logged_in_at": None,
+        "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
     })
     return jsonify({"success": True})
 

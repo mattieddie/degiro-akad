@@ -52,29 +52,38 @@ python proxy.py --origin https://<dein-nutzername>.github.io
 ```
 
 **Optional: Financial Modeling Prep als dritte Kursquelle.** Falls DEGIRO
-und Yahoo Finance für eine Position keinen verifizierbaren Kursverlauf
-liefern, kann der Proxy zusätzlich [Financial Modeling
-Prep](https://financialmodelingprep.com/) (ISIN-Suche + historische
-EOD-Kurse, kostenloser Plan reicht) versuchen. Dafür einen API-Key auf
-financialmodelingprep.com erstellen und **selbst** als Umgebungsvariable
-setzen, bevor `proxy.py` startet – der Key wird nirgends im Code oder in
-einer Datei abgelegt, nur zur Laufzeit aus der Umgebungsvariable gelesen:
+und Yahoo Finance für eine Position keine Daten liefern, kann der Proxy
+zusätzlich [Financial Modeling Prep](https://financialmodelingprep.com/)
+(ISIN-Suche + historische EOD-Kurse, kostenloser Plan reicht) versuchen.
+Einen API-Key auf financialmodelingprep.com erstellen, dann **eine** von
+zwei Optionen:
 
-```powershell
-# PowerShell
-$env:FMP_API_KEY = "dein-key"
-python proxy.py
-```
+- **Beim Verbinden eingeben**: Feld „Financial Modeling Prep API-Key
+  (optional)“ auf der Webseite – wird direkt an den lokalen Proxy gesendet,
+  dort nur im Arbeitsspeicher für die laufende Sitzung gehalten und nie auf
+  Platte geschrieben. Landet (wie die Proxy-Adresse) zur Bequemlichkeit im
+  localStorage deines Browsers, damit du ihn nicht jedes Mal neu eintippen
+  musst – „Lokale Daten löschen“ entfernt ihn wieder.
+- **Als Umgebungsvariable**, bevor `proxy.py` startet (praktisch, wenn du
+  den Proxy öfter per Skript startest):
 
-```bash
-# bash
-FMP_API_KEY=dein-key python proxy.py
-```
+  ```powershell
+  # PowerShell
+  $env:FMP_API_KEY = "dein-key"
+  python proxy.py
+  ```
 
-Ohne gesetzte Variable wird diese Quelle einfach übersprungen (siehe
-Konsolenausgabe beim Start). Falls du versehentlich einen Key im Klartext
-irgendwo geteilt hast (z.B. in einem Chat), empfiehlt es sich, ihn bei
-Financial Modeling Prep zu regenerieren.
+  ```bash
+  # bash
+  FMP_API_KEY=dein-key python proxy.py
+  ```
+
+In beiden Fällen wird der Key nirgends im Code oder in einer Datei
+hartkodiert. Ohne einen der beiden Wege wird diese Quelle einfach
+übersprungen (siehe Konsolenausgabe beim Start bzw. `/api/health` →
+`fmpConfigured`). Falls du versehentlich einen Key im Klartext irgendwo
+geteilt hast (z.B. in einem Chat), empfiehlt es sich, ihn bei Financial
+Modeling Prep zu regenerieren.
 
 ### 2. Webseite öffnen
 
