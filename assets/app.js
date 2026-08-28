@@ -557,8 +557,8 @@ async function connectAndLoad() {
   } catch (err) {
     setOnlineBadge(false);
     setMessage(
-      "Fehler: " + err.message + " (laeuft der lokale Proxy? Ist das Token korrekt? Falls DEGIRO eine " +
-      "Bestaetigung in der App verlangt hat, bitte in der DEGIRO-App bestaetigen und erneut versuchen.)",
+      "Fehler: " + err.message + " (Falls DEGIRO eine Bestaetigung in der App verlangt hat, bitte in der " +
+      "DEGIRO-App bestaetigen und erneut versuchen.)",
       "error"
     );
   } finally {
@@ -632,6 +632,5 @@ renderAllFromCache();
 
 // Falls schon einmal verbunden: Online-Status pruefen, ohne Passwort erneut abzufragen.
 proxyFetch("/api/health")
-    .then((res) => setOnlineBadge(!!res.logged_in))
-    .catch(() => setOnlineBadge(false));
-}
+  .then((res) => setOnlineBadge(!!res.logged_in))
+  .catch(() => setOnlineBadge(false));

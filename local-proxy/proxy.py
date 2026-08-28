@@ -1,19 +1,21 @@
 """
-Lokaler DEGIRO-Proxy fuer das degiro-akad Dashboard.
+Lokaler DEGIRO-Proxy + Web-App fuer das degiro-akad Dashboard.
 
-Laeuft NUR auf deinem eigenen Rechner (127.0.0.1) und leitet Anfragen von der
-GitHub-Pages-Seite an DEGIRO (und an eine oeffentliche, kostenlose FX-API fuer
-Waehrungsumrechnung) weiter. Es wird NICHTS auf die Festplatte oder nach
-GitHub geschrieben - Login-Daten und DEGIRO-Antworten leben ausschliesslich
-im Arbeitsspeicher dieses Prozesses, solange er laeuft. Beendest du das
-Skript (Strg+C), ist alles weg.
+Laeuft NUR auf deinem eigenen Rechner (127.0.0.1). Liefert die Web-Oberflaeche
+(index.html/assets/*) direkt selbst mit aus und leitet API-Anfragen an DEGIRO
+(und an eine oeffentliche, kostenlose FX-API fuer Waehrungsumrechnung) weiter.
+Es wird NICHTS auf die Festplatte oder nach GitHub geschrieben - Login-Daten
+und DEGIRO-Antworten leben ausschliesslich im Arbeitsspeicher dieses
+Prozesses, solange er laeuft. Beendest du das Skript (Strg+C), ist alles weg.
 
 Start:
     pip install -r requirements.txt
     python proxy.py
 
+Dann im Browser oeffnen: http://127.0.0.1:8765/
+
 Optional:
-    python proxy.py --port 8765 --origin https://mattieddie.github.io
+    python proxy.py --port 8765
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from datetime import date, datetime, timedelta
 from functools import wraps
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
 from degiro_connector.core.exceptions import DeGiroConnectionError
 from degiro_connector.quotecast.models.chart import ChartRequest, Interval
@@ -69,12 +71,6 @@ TARGET_CURRENCY = "CHF"
 #   PowerShell:  $env:FMP_API_KEY = "dein-key"; python proxy.py
 #   bash:        FMP_API_KEY=dein-key python proxy.py
 FMP_API_KEY = os.environ.get("FMP_API_KEY")
-
-# Serverseitige Sitzungen bleiben nur im Speicher dieser laufenden Instanz.
-# Der Browser erhält ausschließlich eine HttpOnly-Cookie-ID, nie ein Backend-Token.
-SESSION_STORE: dict[str, dict] = {}
-SESSION_COOKIE = "degiro_session"
-SESSION_MAX_AGE = 60 * 60 * 12
 
 ALLOWED_ORIGINS: list[str] = []
 
@@ -478,16 +474,27 @@ def resolve_price_series(
 
 
 # --- Auth-Decorators ---------------------------------------------------------
+# Gleiches Cookie-Sitzungsmodell wie das Vercel-Backend (api/index.py), nur
+# dass die Sitzung hier in einem einfachen In-Memory-Dict liegt statt einem
+# externen KV-Store - unproblematisch, weil dieser Prozess (anders als eine
+# Vercel-Funktion) durchgehend als EIN langlebiger Prozess laeuft. Kein
+# separates Proxy-Token mehr noetig: der Proxy ist ohnehin nur ueber
+# 127.0.0.1 erreichbar, also nur von diesem einen Rechner aus.
+
+SESSION_STORE: dict[str, dict] = {}
+SESSION_COOKIE = "degiro_session"
+SESSION_MAX_AGE = 60 * 60 * 12
+
 
 def require_auth(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         session_id = request.cookies.get(SESSION_COOKIE, "")
-        session = SESSION_STORE.get(session_id)
-        if not session_id or session is None:
-            return jsonify({"error": "Backend-Sitzung fehlt oder ist abgelaufen"}), 401
-        SESSION.clear()
-        SESSION.update(session)
+        stored = SESSION_STORE.get(session_id)
+        SESSION.update(stored or {
+            "trading_api": None, "int_account": None, "user_token": None,
+            "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
+        })
         return fn(*args, **kwargs)
 
     return wrapper
@@ -520,9 +527,27 @@ def options_handler(_any):
     return ("", 204)
 
 
+# --- Statische Seiten (index.html, assets/*) --------------------------------
+# Damit du die App direkt unter http://127.0.0.1:8765/ oeffnen kannst (kein
+# GitHub Pages noetig) - dasselbe Frontend wie beim Vercel-Deployment.
+
+STATIC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@app.route("/", methods=["GET"])
+def serve_index():
+    return send_from_directory(STATIC_ROOT, "index.html")
+
+
+@app.route("/assets/<path:filename>", methods=["GET"])
+def serve_assets(filename):
+    return send_from_directory(os.path.join(STATIC_ROOT, "assets"), filename)
+
+
 # --- Endpunkte: Verbindung ---------------------------------------------------
 
 @app.route("/api/health", methods=["GET"])
+@require_auth
 def health():
     return jsonify({
         "status": "ok",
@@ -561,28 +586,25 @@ def login():
         user_token = client_details["data"]["id"]
         trading_api.credentials.int_account = int_account
 
-        SESSION["trading_api"] = trading_api
-        SESSION["int_account"] = int_account
-        SESSION["user_token"] = user_token
-        SESSION["base_currency"] = detect_base_currency(client_details)
-        SESSION["logged_in_at"] = datetime.now().isoformat()
-        # Nur im RAM fuer die Dauer dieser Sitzung - nie auf Platte geschrieben.
-        # Ueberschreibt bewusst nicht mit None, falls dieses Login-Formular
-        # ohne Key abgeschickt wurde, aber vorher schon einer per Umgebungs-
-        # variable galt (siehe get_fmp_api_key()).
-        if fmp_api_key:
-            SESSION["fmp_api_key"] = fmp_api_key
-
+        base_currency = detect_base_currency(client_details)
         session_id = secrets.token_urlsafe(32)
-        SESSION_STORE[session_id] = SESSION.copy()
-        logger.info("Login erfolgreich (int_account=%s, base_currency=%s)", int_account, SESSION["base_currency"])
-        response = jsonify({"success": True, "baseCurrency": SESSION["base_currency"]})
+        SESSION_STORE[session_id] = {
+            "trading_api": trading_api,
+            "int_account": int_account,
+            "user_token": user_token,
+            "base_currency": base_currency,
+            "logged_in_at": datetime.now().isoformat(),
+            "fmp_api_key": fmp_api_key,
+        }
+
+        logger.info("Login erfolgreich (int_account=%s, base_currency=%s)", int_account, base_currency)
+        response = jsonify({"success": True, "baseCurrency": base_currency})
         response.set_cookie(
             SESSION_COOKIE,
             session_id,
             max_age=SESSION_MAX_AGE,
             httponly=True,
-            secure=True,
+            secure=False,  # laeuft nur auf http://127.0.0.1, kein HTTPS lokal
             samesite="Lax",
         )
         return response
@@ -621,19 +643,21 @@ def _connect_with_in_app_wait(trading_api: TradingAPI, max_wait_seconds: int = 9
 @app.route("/api/logout", methods=["POST"])
 @require_auth
 def logout():
-    session_id = request.cookies.get(SESSION_COOKIE, "")
-    SESSION_STORE.pop(session_id, None)
     trading_api = SESSION.get("trading_api")
     if trading_api is not None:
         try:
             trading_api.logout()
         except Exception:  # noqa: BLE001
             pass
+    session_id = request.cookies.get(SESSION_COOKIE, "")
+    SESSION_STORE.pop(session_id, None)
     SESSION.update({
         "trading_api": None, "int_account": None, "user_token": None,
         "base_currency": None, "logged_in_at": None, "fmp_api_key": None,
     })
-    return jsonify({"success": True})
+    response = jsonify({"success": True})
+    response.delete_cookie(SESSION_COOKIE)
+    return response
 
 
 # --- Endpunkte: Portfolio -----------------------------------------------------
@@ -1245,8 +1269,7 @@ def main():
     print(" DEGIRO-Proxy laeuft lokal. Nichts wird gespeichert oder an GitHub gesendet.")
     print(" Waehrungsumrechnung nach CHF via api.frankfurter.app (oeffentliche EZB-Kurse).")
     print(f" Kursquellen: DEGIRO, Yahoo Finance, Financial Modeling Prep ({'aktiv' if FMP_API_KEY else 'kein FMP_API_KEY gesetzt - uebersprungen'})")
-    print(f" Erlaubte Herkunft(en): {', '.join(ALLOWED_ORIGINS)}")
-    print(f" Adresse: http://127.0.0.1:{args.port}")
+    print(f" Oeffne im Browser: http://127.0.0.1:{args.port}/")
     print(" Beenden mit Strg+C")
     print("=" * 70)
 
