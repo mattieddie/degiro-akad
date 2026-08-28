@@ -26,6 +26,8 @@ const LS_KEYS = {
   history: "degiro_history",
   historyBackfill: "degiro_history_backfill",
   positionHistory: "degiro_position_history",
+  closedPositions: "degiro_closed_positions",
+  showClosed: "degiro_show_closed",
 };
 
 const RANGE_ORDER = ["1D", "1W", "1M", "3M", "6M", "1Y", "YTD", "MAX"];
@@ -298,6 +300,43 @@ function renderTransactions(transactions) {
   }
 }
 
+// --- Geschlossene Positionen ---------------------------------------------------
+
+function renderClosedPositions(positions) {
+  const section = el("panel-closed");
+  if (!positions || !positions.length) {
+    section.classList.add("hidden");
+    return;
+  }
+  section.classList.remove("hidden");
+
+  const show = loadLocal(LS_KEYS.showClosed, true);
+  el("toggle-closed").checked = show;
+  el("closed-table-wrap").classList.toggle("hidden", !show);
+
+  const tbody = document.querySelector("#table-closed tbody");
+  tbody.innerHTML = "";
+  for (const p of positions) {
+    const tr = document.createElement("tr");
+    const plClass = p.realizedPlChf > 0 ? "pl-pos" : p.realizedPlChf < 0 ? "pl-neg" : "";
+    const plPctTxt = p.realizedPlPct !== null && p.realizedPlPct !== undefined ? ` (${p.realizedPlPct.toFixed(1)}%)` : "";
+    tr.innerHTML = `
+      <td>${p.name ?? p.productId} <span class="tag">geschlossen</span></td>
+      <td>${p.symbol ?? "–"}</td>
+      <td>${p.firstDate ?? "–"} – ${p.lastDate ?? "–"}</td>
+      <td>${fmtChf(p.investedChf)}</td>
+      <td>${fmtChf(p.proceedsChf)}</td>
+      <td class="${plClass}">${fmtChf(p.realizedPlChf)}${plPctTxt}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+el("toggle-closed").addEventListener("change", (e) => {
+  saveLocal(LS_KEYS.showClosed, e.target.checked);
+  el("closed-table-wrap").classList.toggle("hidden", !e.target.checked);
+});
+
 // --- Positions-Popup ----------------------------------------------------------
 
 function appendPositionHistoryPoint(productId, point) {
@@ -323,11 +362,13 @@ function mergePositionSeries(backendSeries, organic) {
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
-let modalSeries = [];
+let modalFullSeries = [];
+let modalCurrency = null;
 let modalMode = "value";
+let modalRange = "MAX";
 
-function renderModalChart(series, currency) {
-  modalSeries = series;
+function renderModalChart() {
+  const series = filterByRange(modalFullSeries, modalRange);
   const ctx = el("modal-chart").getContext("2d");
   if (modalChart) modalChart.destroy();
 
@@ -338,7 +379,7 @@ function renderModalChart(series, currency) {
     modalChart = new Chart(ctx, {
       type: "line",
       data: { labels: series.map((s) => s.date), datasets: [{
-        label: "Performance (%) seit Kauf",
+        label: "Performance (%) seit Range-Start",
         data: pct, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,0.15)",
         tension: 0.2, fill: true, pointRadius: series.length > 90 ? 0 : 2,
       }] },
@@ -348,7 +389,7 @@ function renderModalChart(series, currency) {
     modalChart = new Chart(ctx, {
       type: "line",
       data: { labels: series.map((s) => s.date), datasets: [{
-        label: `Kurs (${currency || "native"})`,
+        label: `Kurs (${modalCurrency || "native"})`,
         data: series.map((s) => s.priceNative),
         borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,0.15)",
         tension: 0.2, fill: true, pointRadius: series.length > 90 ? 0 : 2,
@@ -358,13 +399,24 @@ function renderModalChart(series, currency) {
   }
 }
 
-function setModalModeButtons(currency) {
+function setModalModeButtons() {
   document.querySelectorAll("#modal-mode-buttons .range-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.mode === modalMode);
     btn.onclick = () => {
       modalMode = btn.dataset.mode;
-      setModalModeButtons(currency);
-      renderModalChart(modalSeries, currency);
+      setModalModeButtons();
+      renderModalChart();
+    };
+  });
+}
+
+function setModalRangeButtons() {
+  document.querySelectorAll("#modal-range-buttons .range-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.range === modalRange);
+    btn.onclick = () => {
+      modalRange = btn.dataset.range;
+      setModalRangeButtons();
+      renderModalChart();
     };
   });
 }
@@ -374,6 +426,8 @@ function closeModal() { el("modal-overlay").classList.add("hidden"); }
 
 async function openPositionModal(position) {
   modalMode = "value";
+  modalRange = "MAX";
+  modalCurrency = position.currency;
   el("modal-title").textContent = position.name || position.productId;
   el("modal-subtitle").textContent = `${position.symbol || ""} · ${position.currency || ""} · ${position.productType || ""}`;
   el("modal-isin").textContent = position.isin || "–";
@@ -384,7 +438,8 @@ async function openPositionModal(position) {
   const plPctTxt = position.plUnrealizedPct !== null && position.plUnrealizedPct !== undefined ? ` (${position.plUnrealizedPct.toFixed(1)}%)` : "";
   el("modal-pl").textContent = position.plUnrealizedChf !== null && position.plUnrealizedChf !== undefined ? fmtChf(position.plUnrealizedChf) + plPctTxt : "–";
   el("modal-verify-note").textContent = "Lade Kursverlauf...";
-  setModalModeButtons(position.currency);
+  setModalModeButtons();
+  setModalRangeButtons();
   openModal();
 
   const today = new Date().toISOString().slice(0, 10);
@@ -394,11 +449,12 @@ async function openPositionModal(position) {
 
   try {
     const data = await proxyFetch(`/api/position-history?productId=${encodeURIComponent(position.productId)}`);
-    const merged = mergePositionSeries(data.series, organic);
-    renderModalChart(merged, position.currency);
+    modalFullSeries = mergePositionSeries(data.series, organic);
+    renderModalChart();
     el("modal-verify-note").textContent = data.note || "";
   } catch (err) {
-    renderModalChart(organic, position.currency);
+    modalFullSeries = organic;
+    renderModalChart();
     el("modal-verify-note").textContent = "Historischer Verlauf nicht verfügbar (Proxy nicht erreichbar?). Zeige nur lokal erfasste Werte: " + err.message;
   }
 }
@@ -419,6 +475,8 @@ function renderAllFromCache() {
     renderPositions(portfolio.positions);
   }
   if (transactions) renderTransactions(transactions.transactions);
+  const closed = loadLocal(LS_KEYS.closedPositions, null);
+  if (closed) renderClosedPositions(closed.positions);
 
   const merged = mergeHistorySeries(backfill.series, organic);
   if (merged.length) {
@@ -477,18 +535,21 @@ async function connectAndLoad() {
 }
 
 async function refreshData() {
-  const [portfolio, transactions] = await Promise.all([
+  const [portfolio, transactions, closed] = await Promise.all([
     proxyFetch("/api/portfolio"),
     proxyFetch("/api/transactions"),
+    proxyFetch("/api/closed-positions"),
   ]);
 
   saveLocal(LS_KEYS.portfolio, portfolio);
   saveLocal(LS_KEYS.transactions, transactions);
+  saveLocal(LS_KEYS.closedPositions, closed);
   const organic = appendHistoryPoint(portfolio.totals);
 
   renderSummary(portfolio.totals, portfolio.fetchedAt);
   renderPositions(portfolio.positions);
   renderTransactions(transactions.transactions);
+  renderClosedPositions(closed.positions);
 
   // Backfill ist rechenintensiv (Kurscharts + FX) - im Hintergrund laden,
   // damit Portfolio/Positionen sofort sichtbar sind.

@@ -223,13 +223,28 @@ def verify_series(
     reference_price: float | None,
     reference_date: str | None,
     tolerance_pct: float = 0.01,
+    date_window_days: int = 2,
 ) -> bool:
+    """
+    Prueft, ob series_map am reference_date (oder bis zu date_window_days
+    davor/danach - Anbieter koennen bei Wochenenden/Feiertagen leicht
+    unterschiedliche letzte Handelstage melden) einen Preis nahe
+    reference_price hat.
+    """
     if not series_map or reference_price is None or not reference_date:
         return False
-    got = series_map.get(reference_date)
-    if got is None:
+    try:
+        ref_day = date.fromisoformat(reference_date)
+    except ValueError:
         return False
-    return abs(got - reference_price) <= max(0.01, reference_price * tolerance_pct)
+    tol = max(0.01, reference_price * tolerance_pct)
+    for offset in range(0, date_window_days + 1):
+        candidates = {ref_day} if offset == 0 else {ref_day - timedelta(days=offset), ref_day + timedelta(days=offset)}
+        for d in candidates:
+            got = series_map.get(d.isoformat())
+            if got is not None and abs(got - reference_price) <= tol:
+                return True
+    return False
 
 
 # --- Hilfsfunktionen: historische Kurse, Fallback (Yahoo Finance) -----------
@@ -933,6 +948,99 @@ def position_history():
     except Exception as e:  # noqa: BLE001
         logger.exception("Fehler beim Abrufen der Positions-Historie")
         return jsonify({"error": f"Fehler beim Abrufen der Positions-Historie: {e}"}), 502
+
+
+@app.route("/api/closed-positions", methods=["GET"])
+@require_auth
+@require_login
+def closed_positions():
+    """
+    Realisiertes G/V vergangener, bereits verkaufter Positionen - reine
+    Buchhaltung aus der Transaktionshistorie (kein Kurschart noetig, daher
+    exakt statt Naeherung): Summe aller Cashflows (inkl. Gebuehren) je
+    Produkt, das aktuell nicht mehr gehalten wird.
+    """
+    trading_api = SESSION["trading_api"]
+    base_currency = SESSION["base_currency"] or "EUR"
+    try:
+        tx_history = trading_api.get_transactions_history(
+            transaction_request=HistoryRequest(from_date=date(2005, 1, 1), to_date=date.today()),
+            raw=True,
+        )
+        tx_items = (tx_history or {}).get("data") or []
+        if not tx_items:
+            return jsonify({"positions": []})
+
+        by_product: dict[str, list[dict]] = {}
+        for t in tx_items:
+            pid = str(t.get("productId"))
+            by_product.setdefault(pid, []).append(t)
+
+        account_update = trading_api.get_update(
+            request_list=[UpdateRequest(option=UpdateOption.PORTFOLIO, last_updated=0)],
+            raw=True,
+        )
+        current_positions = _flatten_rows((account_update.get("portfolio") or {}).get("value") or [])
+        current_ids = {str(p.get("id")) for p in current_positions if _num(p.get("size")) != 0}
+
+        closed_ids = [pid for pid in by_product if pid.isdigit() and pid not in current_ids]
+        if not closed_ids:
+            return jsonify({"positions": []})
+
+        info_raw = trading_api.get_products_info(product_list=[int(p) for p in closed_ids], raw=True)
+        product_info = (info_raw or {}).get("data", {})
+
+        fx_series_cache: dict[str, float] = {}
+        if base_currency != TARGET_CURRENCY:
+            fx_series_cache = get_fx_series(date(2005, 1, 1), date.today(), base_currency, TARGET_CURRENCY)
+
+        def to_chf(amount, day: date) -> float:
+            if base_currency == TARGET_CURRENCY:
+                return _num(amount)
+            return _num(amount) * fx_rate_on(fx_series_cache, day, fallback=1.0)
+
+        results = []
+        for pid in closed_ids:
+            txs = sorted(by_product[pid], key=lambda x: str(x.get("date")))
+            info = product_info.get(pid, {})
+
+            realized_pl_chf = 0.0
+            invested_chf = 0.0
+            proceeds_chf = 0.0
+            for t in txs:
+                day = date.fromisoformat(str(t.get("date"))[:10])
+                amount = t.get("totalPlusAllFeesInBaseCurrency")
+                if amount is None:
+                    amount = t.get("totalInBaseCurrency")
+                amount_chf = to_chf(amount, day)
+                realized_pl_chf += amount_chf
+                if t.get("buysell") == "B":
+                    invested_chf += -amount_chf  # Kauf: amount ist negativ (Cash-Abfluss) -> Investition positiv
+                else:
+                    proceeds_chf += amount_chf
+
+            pl_pct = (realized_pl_chf / invested_chf * 100) if invested_chf > 0 else None
+
+            results.append({
+                "productId": pid,
+                "name": info.get("name"),
+                "symbol": info.get("symbol"),
+                "isin": info.get("isin"),
+                "currency": info.get("currency"),
+                "firstDate": str(txs[0].get("date"))[:10],
+                "lastDate": str(txs[-1].get("date"))[:10],
+                "investedChf": round(invested_chf, 2),
+                "proceedsChf": round(proceeds_chf, 2),
+                "realizedPlChf": round(realized_pl_chf, 2),
+                "realizedPlPct": round(pl_pct, 2) if pl_pct is not None else None,
+                "transactionCount": len(txs),
+            })
+
+        results.sort(key=lambda r: r["lastDate"], reverse=True)
+        return jsonify({"positions": results})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Fehler beim Abrufen der geschlossenen Positionen")
+        return jsonify({"error": f"Fehler beim Abrufen der geschlossenen Positionen: {e}"}), 502
 
 
 def main():

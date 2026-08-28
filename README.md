@@ -144,8 +144,32 @@ neu gekauften Positionen entwickeln.
 ## Positions-Detailansicht
 
 Klick auf eine Position öffnet ein Popup mit Kursverlauf (gleiche
-Verifizierungslogik wie oben, ebenfalls mit Kurs/Performance(%)-Umschalter)
-sowie ISIN, Stückzahl, Kurs, Wert und unrealisiertem G/V (CHF und %).
+Verifizierungslogik wie oben, mit Kurs/Performance(%)-Umschalter und
+denselben wählbaren Zeiträumen 1T–Max wie der Hauptgraph) sowie ISIN,
+Stückzahl, Kurs, Wert und unrealisiertem G/V (CHF und %).
+
+## Vergangene (geschlossene) Positionen
+
+Positionen, die aktuell nicht mehr gehalten werden, aber in der
+Transaktionshistorie vorkommen, erscheinen in einem eigenen, mit
+„geschlossen" markierten Abschnitt mit realisiertem Gewinn/Verlust. Das ist
+**keine** Näherung, sondern reine Buchhaltung: Summe aller Käufe/Verkäufe
+inkl. Gebühren aus der Transaktionshistorie – kein Kurschart nötig. Über die
+Checkbox „anzeigen" lässt sich der Abschnitt ausblenden (wird lokal
+gemerkt).
+
+## Zusätzliche Kursquelle (massive.com) geprüft, nicht eingebaut
+
+Auf Anfrage geprüft: [massive.com](https://massive.com) (ehem. Polygon.io)
+bietet historische Kursdaten, erfordert aber einen kostenpflichtigen
+API-Key und deckt laut eigener Dokumentation primär US-Börsen ab. Da die
+Positionen in diesem Dashboard i.d.R. europäische UCITS-ETFs sind, würde
+das die eigentliche Lücke nicht schliessen. Stattdessen wurde geprüft, dass
+Yahoo Finance über ISIN-Suche auch für europäische ETFs korrekt auflöst
+(z.B. IE00B4L5Y983 → IWDA.L), und die Datums-Toleranz bei der Verifizierung
+gegen DEGIROs Schlusskurs auf ±2 Tage erweitert (reduziert False-Negatives
+durch unterschiedliche Handelstage/Zeitzonen zwischen Anbietern, ohne die
+Preis-Toleranz selbst aufzuweichen).
 
 ## Sicherheits- und Risikohinweise
 

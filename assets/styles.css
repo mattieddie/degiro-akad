@@ -153,6 +153,25 @@ th { color: var(--text-muted); font-weight: 500; }
 }
 .range-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
 
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.checkbox-label input { cursor: pointer; }
+
+.tag {
+  display: inline-block;
+  font-size: 0.7rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
 .modal-overlay {
   position: fixed;
   inset: 0;
