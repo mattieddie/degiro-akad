@@ -181,6 +181,7 @@ oben trieb). Stattdessen rein rechnerisch hergeleitet:
 
 ```
 NettoEinzahlungen(t) = Cash-Saldo(t) − kumulierter Handels-Cashflow(t)
+                                     − kumulierter Dividenden-Cashflow(t)
 ```
 
 Der Handels-Cashflow kommt direkt aus der (bereits an anderer Stelle
@@ -190,6 +191,14 @@ einzelne Buchung intern kategorisiert. Zahlst du Geld ein und kaufst davon
 Aktien, steigt der Nenner sofort mit, der Zähler (Depotwert) aber erst durch
 tatsächliche Kursgewinne – eine Einzahlung erzeugt also keinen künstlichen
 Sprung nach oben, sondern höchstens eine kurze Verwässerung.
+
+Der Dividenden-Cashflow wird separat abgezogen, damit erhaltene Dividenden
+(und die darauf abgezogene Quellensteuer) als Gewinn zählen statt fälschlich
+als Einzahlung – sie erhöhen sonst den Cash-Saldo, ohne Teil des
+Handels-Cashflows zu sein. Anders als bei "Einzahlung vs. Handel" lässt sich
+das hier zuverlässig klassifizieren: DEGIROs `type`-Feld unterscheidet
+Dividenden nicht von anderen Kontobuchungen, aber das `description`-Feld
+enthält zuverlässig "Dividende" bzw. "Dividendensteuer".
 
 Die Prozentkurve **beginnt immer bei 0% am Start des gewählten Zeitraums**:
 angezeigt wird `((1+G(t)) / (1+G(Range-Start)) − 1) × 100`, also die

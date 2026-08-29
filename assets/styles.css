@@ -120,6 +120,17 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .stat-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
 .stat-value { font-size: 1.4rem; font-weight: 600; }
 
+.stat-toggle { display: flex; gap: 0.3rem; }
+.stat-toggle-btn {
+  padding: 0.15rem 0.5rem;
+  font-size: 0.68rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+}
+.stat-toggle-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
+
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
 th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--border); white-space: nowrap; }

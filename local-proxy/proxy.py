@@ -828,6 +828,16 @@ def portfolio():
             pl_unrealized_chf = pl_unrealized_native * fx if pl_unrealized_native is not None else None
             pl_pct = ((price - avg_price) / avg_price * 100) if avg_price else None
 
+            # Tages-G/V = Stueck * (aktueller Kurs - DEGIROs zuletzt gemeldetem
+            # Schlusskurs "closePrice", derselbe Referenzwert wie bei der
+            # Seit-Kauf-Rekonstruktion, siehe history_backfill()). Fehlt er
+            # (z.B. Produkt ohne Kursdaten), bleibt der Tages-G/V unbekannt statt
+            # mit einem falschen Wert (z.B. 0) aufzufuellen.
+            raw_close_price = info.get("closePrice")
+            close_price = float(raw_close_price) if isinstance(raw_close_price, (int, float)) else None
+            pl_day_native = size * (price - close_price) if close_price else None
+            pl_day_chf = pl_day_native * fx if pl_day_native is not None else None
+
             total_value_chf += value_chf
 
             enriched.append({
@@ -845,14 +855,21 @@ def portfolio():
                 "priceChf": price * fx,
                 "averagePrice": avg_price,
                 "averagePriceChf": avg_cost_chf,
+                "closePrice": close_price,
                 "value": value_native,
                 "valueChf": value_chf,
                 "plUnrealized": pl_unrealized_native,
                 "plUnrealizedChf": pl_unrealized_chf,
                 "plUnrealizedPct": pl_pct,
+                "plDay": pl_day_native,
+                "plDayChf": pl_day_chf,
             })
 
         equity_chf = total_value_chf + cash_chf
+        pl_total_chf_values = [p["plUnrealizedChf"] for p in enriched if p["plUnrealizedChf"] is not None]
+        pl_day_chf_values = [p["plDayChf"] for p in enriched if p["plDayChf"] is not None]
+        pl_total_chf = sum(pl_total_chf_values) if pl_total_chf_values else None
+        pl_day_chf_total = sum(pl_day_chf_values) if pl_day_chf_values else None
 
         return jsonify({
             "fetchedAt": datetime.now().isoformat(),
@@ -865,6 +882,8 @@ def portfolio():
                 "cashNative": cash_amount,
                 "cashCurrency": cash_currency,
                 "positionsValueChf": total_value_chf,
+                "plTotalChf": pl_total_chf,
+                "plDayChf": pl_day_chf_total,
             },
         })
     except Exception as e:  # noqa: BLE001
@@ -963,12 +982,25 @@ def _get_cash_and_deposits_history_chf(
     Einzahlungen/Sweeps in den Cash-Fund tragen offenbar auch eine productId
     und wurden faelschlich als Handel statt als Einzahlung gezaehlt, was die
     Kennzahl bei jeder so verpassten Einzahlung sprunghaft nach oben trieb).
-    Stattdessen rein rechnerisch aus zwei bereits verlaesslichen Groessen
+    Stattdessen rein rechnerisch aus drei bereits verlaesslichen Groessen
     hergeleitet:
         NettoEinzahlungen(t) = Cash-Saldo(t) - kumulierter Handels-Cashflow(t)
+                                              - kumulierter Dividenden-Cashflow(t)
     Der Handels-Cashflow kommt direkt aus der Transaktionshistorie (bereits
     an anderer Stelle erfolgreich genutzt), nicht aus den mehrdeutigen
-    Kontobuchungen. Diese Herleitung setzt voraus, dass der Cash-Saldo am
+    Kontobuchungen. Ohne den Dividenden-Abzug wuerden erhaltene Dividenden
+    (und die darauf abgezogene Quellensteuer) faelschlich wie eine Einzahlung
+    gezaehlt statt wie ein Gewinn, da sie den Cash-Saldo erhoehen, aber nicht
+    Teil des Handels-Cashflows sind - das druecke "Seit Einzahlung" ungefaehr
+    um die Summe der erhaltenen Dividenden zu tief. Anders als bei "Einzahlung
+    vs. Handel" ist die Dividenden-Klassifizierung hier zuverlaessig moeglich:
+    DEGIROs 'type'-Feld unterscheidet Dividenden nicht von anderen Cash-
+    Buchungen (durchgehend "CASH_TRANSACTION"), aber das 'description'-Feld
+    enthaelt bei diesem (deutschsprachigen) Konto zuverlaessig "Dividende"
+    bzw. "Dividendensteuer" - verifiziert anhand der echten Kontobuchungen
+    dieses Nutzers. Stornierte/korrigierte Dividenden (negative Betraege mit
+    passender Beschreibung) gleichen sich beim Aufsummieren automatisch
+    korrekt aus. Diese Herleitung setzt voraus, dass der Cash-Saldo am
     allerersten Tag (since_d) noch keine Aktivität von vor since_d enthält -
     zutreffend, da since_d der Tag der ersten je getaetigten Transaktion ist.
     """
@@ -1038,6 +1070,21 @@ def _get_cash_and_deposits_history_chf(
 
     filled_trade_cf = _forward_fill(trade_cashflow_by_day, since_d, date.today())
     trade_cf_by_day = {c["date"]: (c["value"] or 0.0) for c in filled_trade_cf}
+
+    dividend_movements = sorted(
+        (m for m in movements if m.date is not None and m.change is not None
+         and m.description and "divid" in m.description.lower()),
+        key=lambda mv: mv.date,
+    )
+    dividend_cashflow_by_day: dict[str, float] = {}
+    running = 0.0
+    for m in dividend_movements:
+        day = m.date.date()
+        running += _to_chf(m.currency, m.change, day)
+        dividend_cashflow_by_day[day.isoformat()] = running
+    filled_dividend_cf = _forward_fill(dividend_cashflow_by_day, since_d, date.today())
+    dividend_cf_by_day = {c["date"]: (c["value"] or 0.0) for c in filled_dividend_cf}
+
     filled_cash = _forward_fill(cash_result, since_d, date.today())
 
     deposits_result: dict[str, float] = {}
@@ -1045,7 +1092,7 @@ def _get_cash_and_deposits_history_chf(
         d = c["date"]
         if c["value"] is None:
             continue
-        deposits_result[d] = c["value"] - trade_cf_by_day.get(d, 0.0)
+        deposits_result[d] = c["value"] - trade_cf_by_day.get(d, 0.0) - dividend_cf_by_day.get(d, 0.0)
 
     return cash_result, deposits_result
 

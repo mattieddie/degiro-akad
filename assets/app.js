@@ -39,6 +39,9 @@ let lastPositions = [];
 let currentRange = "MAX";
 let currentMode = "value";
 let historyChart = null;
+let lastTotals = null;
+let latestNetDeposits = null;
+let plTotalMode = "unrealized";
 let modalChart = null;
 
 function loadLocal(key, fallback) {
@@ -242,8 +245,21 @@ function xAxisOptions() {
   };
 }
 
+function latestDefined(series, key) {
+  for (let i = series.length - 1; i >= 0; i--) {
+    const v = series[i][key];
+    if (v !== null && v !== undefined) return v;
+  }
+  return null;
+}
+
 function renderChart(fullSeries) {
   el("panel-chart").classList.remove("hidden");
+  // Unabhaengig vom gewaehlten Chart-Zeitraum: die aktuellsten bekannten
+  // kumulierten Netto-Einzahlungen fuer die "Seit Einzahlung"-Ansicht des
+  // Total-P/L-Kaestchens (siehe renderPlTotalStat).
+  latestNetDeposits = latestDefined(fullSeries, "netDeposits");
+  renderPlTotalStat();
   const series = filterByRange(fullSeries, currentRange);
   const ctx = el("chart-history").getContext("2d");
   const labels = series.map((h) => h.date);
@@ -356,11 +372,56 @@ function setModeButtons() {
 
 // --- Summary / Positionen ----------------------------------------------------
 
+function setPlStat(id, value, pct) {
+  const target = el(id);
+  const pctTxt = pct !== null && pct !== undefined && !Number.isNaN(pct) ? ` (${pct > 0 ? "+" : ""}${pct.toFixed(1)}%)` : "";
+  target.textContent = value !== null && value !== undefined ? fmtChf(value) + pctTxt : "–";
+  target.className = "stat-value " + (value > 0 ? "pl-pos" : value < 0 ? "pl-neg" : "");
+}
+
+// Total-P/L-Kaestchen ist umschaltbar zwischen dem unrealisierten G/V der
+// offenen Positionen (aus /api/portfolio) und der Gesamtperformance seit
+// der allerersten Einzahlung (Gesamtwert minus kumulierte Netto-Einzahlungen,
+// dieselbe einzahlungsbereinigte Basis wie die Prozent-Performance im Chart -
+// siehe latestNetDeposits in renderChart). Beide Werte werden unabhaengig
+// voneinander aktualisiert (Portfolio vs. Verlauf/Backfill laden getrennt),
+// daher zeigt renderPlTotalStat immer den zuletzt bekannten Stand beider an.
+function renderPlTotalStat() {
+  if (plTotalMode === "deposits") {
+    // G(t) = (Depotwert - Netto-Einzahlungen) / Netto-Einzahlungen, siehe README -
+    // derselbe einzahlungsbereinigte Prozentsatz wie im Performance-Chart, hier aber
+    // nicht auf einen Range-Start rebasiert, sondern seit der allerersten Einzahlung.
+    const value = (lastTotals && lastTotals.equityChf != null && latestNetDeposits != null)
+      ? lastTotals.equityChf - latestNetDeposits
+      : null;
+    const pct = (value !== null && latestNetDeposits) ? (value / latestNetDeposits) * 100 : null;
+    setPlStat("stat-pl-total", value, pct);
+  } else {
+    // Prozentsatz relativ zum Einstand (Kostenbasis) der offenen Positionen:
+    // Kostenbasis = aktueller Positionswert - unrealisierter G/V.
+    const value = lastTotals ? lastTotals.plTotalChf : null;
+    const costBasis = (lastTotals && value !== null) ? lastTotals.positionsValueChf - value : null;
+    const pct = (costBasis) ? (value / costBasis) * 100 : null;
+    setPlStat("stat-pl-total", value, pct);
+  }
+}
+
+document.querySelectorAll("#pl-total-toggle .stat-toggle-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    plTotalMode = btn.dataset.plMode;
+    document.querySelectorAll("#pl-total-toggle .stat-toggle-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    renderPlTotalStat();
+  });
+});
+
 function renderSummary(totals, fetchedAt) {
   el("panel-summary").classList.remove("hidden");
+  lastTotals = totals;
   el("stat-equity").textContent = fmtChf(totals.equityChf);
   el("stat-cash").textContent = fmtChf(totals.cashChf);
   el("stat-positions").textContent = fmtChf(totals.positionsValueChf);
+  renderPlTotalStat();
+  setPlStat("stat-pl-day", totals.plDayChf);
   el("stat-updated").textContent = fetchedAt ? new Date(fetchedAt).toLocaleString("de-CH") : "–";
 }
 
