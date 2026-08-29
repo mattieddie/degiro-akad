@@ -437,14 +437,67 @@ function totalFeesChfForProduct(productId) {
   return transactionsForProduct(productId).reduce((sum, t) => sum + (t.feesChf || 0), 0);
 }
 
+const POSITION_SORT_ACCESSORS = {
+  name: (p) => (p.name ?? String(p.productId ?? "")).toLowerCase(),
+  symbol: (p) => (p.symbol ?? "").toLowerCase(),
+  size: (p) => p.size ?? 0,
+  // "Kurs" wird pro Position in Originalwaehrung angezeigt (fmtNative) - fuer
+  // eine sinnvolle Sortierung ueber Positionen in verschiedenen Waehrungen
+  // hinweg wird trotzdem der CHF-Gegenwert verglichen, nicht der rohe Kurs.
+  price: (p) => p.priceChf ?? 0,
+  value: (p) => p.valueChf ?? 0,
+  // "Anteil" ist eine reine Funktion von valueChf (Anteil am Gesamtwert) -
+  // sortiert daher zwangslaeufig identisch zu "Wert (CHF)".
+  share: (p) => p.valueChf ?? 0,
+  avgPrice: (p) => p.averagePriceChf ?? 0,
+  fees: (p) => totalFeesChfForProduct(p.productId) ?? 0,
+  pl: (p) => p.plUnrealizedChf ?? 0,
+};
+
+let positionsSortKey = null;
+let positionsSortDir = "desc";
+
+function sortedPositions(positions) {
+  if (!positionsSortKey) return positions;
+  const accessor = POSITION_SORT_ACCESSORS[positionsSortKey];
+  const dir = positionsSortDir === "asc" ? 1 : -1;
+  return [...positions].sort((a, b) => {
+    const av = accessor(a);
+    const bv = accessor(b);
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+}
+
+function updatePositionsSortIndicators() {
+  document.querySelectorAll("#table-positions thead th[data-sort]").forEach((th) => {
+    const active = th.dataset.sort === positionsSortKey;
+    th.classList.toggle("sort-active", active);
+    th.classList.remove("sort-asc", "sort-desc");
+    if (active) th.classList.add(positionsSortDir === "asc" ? "sort-asc" : "sort-desc");
+  });
+}
+
+document.querySelectorAll("#table-positions thead th[data-sort]").forEach((th) => {
+  th.addEventListener("click", () => {
+    const key = th.dataset.sort;
+    positionsSortDir = positionsSortKey === key && positionsSortDir === "desc" ? "asc" : "desc";
+    positionsSortKey = key;
+    updatePositionsSortIndicators();
+    renderPositions(lastPositions);
+  });
+});
+
 function renderPositions(positions) {
   lastPositions = positions;
   el("panel-positions").classList.remove("hidden");
   const tbody = document.querySelector("#table-positions tbody");
   tbody.innerHTML = "";
   const totalValue = positions.reduce((sum, p) => sum + (p.valueChf || 0), 0);
+  updatePositionsSortIndicators();
 
-  for (const p of positions) {
+  for (const p of sortedPositions(positions)) {
     const tr = document.createElement("tr");
     const share = totalValue ? ((p.valueChf || 0) / totalValue) * 100 : 0;
     const pl = p.plUnrealizedChf;

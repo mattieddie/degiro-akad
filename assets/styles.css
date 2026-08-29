@@ -139,6 +139,12 @@ th { color: var(--text-muted); font-weight: 500; }
 #table-positions tbody tr { cursor: pointer; }
 #table-positions tbody tr:hover { background: rgba(79,140,255,0.08); }
 
+#table-positions thead th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+#table-positions thead th.sortable:hover { color: var(--text); }
+#table-positions thead th.sort-active { color: var(--accent); }
+#table-positions thead th.sort-asc::after { content: " \2191"; }
+#table-positions thead th.sort-desc::after { content: " \2193"; }
+
 .pl-pos { color: var(--green); }
 .pl-neg { color: var(--red); }
 
