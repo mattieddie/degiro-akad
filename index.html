@@ -72,6 +72,7 @@
   <section id="panel-chart" class="card hidden">
     <div class="chart-header">
       <h2 id="chart-title">Performance über Zeit (CHF)</h2>
+      <button id="chart-info-btn" class="info-btn" type="button" aria-expanded="false" aria-controls="chart-info-popover" title="Erklärung anzeigen">ⓘ</button>
       <span id="chart-perf-badge" class="perf-badge"></span>
       <div id="mode-buttons" class="range-buttons">
         <button data-mode="value" class="range-btn active">Wert (CHF)</button>
@@ -88,15 +89,17 @@
         <button data-range="MAX" class="range-btn active">Max</button>
       </div>
     </div>
-    <p class="hint">
-      Seit-Kauf-Verlauf wird aus deiner Transaktionshistorie und DEGIRO-Kurscharts (bzw. Yahoo Finance
-      als Fallback) rekonstruiert (Näherung, siehe Hinweis unten) und danach lokal mit echten
-      Tages-Schnappschüssen ergänzt, sobald du die Seite mit laufendem Proxy öffnest.
-      Die Prozentzahl oben und die „Performance (%)“-Ansicht beginnen immer bei 0% am Start des
-      gewählten Zeitraums und sind einzahlungsbereinigt: eine Einzahlung plus Aktienkauf zählt
-      nicht als Performance – nur die tatsächliche Wertentwicklung ab dem jeweiligen Kaufzeitpunkt.
-    </p>
-    <p id="history-note" class="hint"></p>
+    <div id="chart-info-popover" class="info-popover hidden">
+      <p class="hint">
+        Seit-Kauf-Verlauf wird aus deiner Transaktionshistorie und DEGIRO-Kurscharts (bzw. Yahoo Finance
+        als Fallback) rekonstruiert (Näherung, siehe Hinweis unten) und danach lokal mit echten
+        Tages-Schnappschüssen ergänzt, sobald du die Seite mit laufendem Proxy öffnest.
+        Die Prozentzahl oben und die „Performance (%)“-Ansicht beginnen immer bei 0% am Start des
+        gewählten Zeitraums und sind einzahlungsbereinigt: eine Einzahlung plus Aktienkauf zählt
+        nicht als Performance – nur die tatsächliche Wertentwicklung ab dem jeweiligen Kaufzeitpunkt.
+      </p>
+      <p id="history-note" class="hint"></p>
+    </div>
     <canvas id="chart-history" height="90"></canvas>
   </section>
 

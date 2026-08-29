@@ -681,6 +681,13 @@ el("btn-refresh").addEventListener("click", () => refreshData().catch((e) => set
 el("btn-disconnect").addEventListener("click", disconnect);
 el("btn-clear").addEventListener("click", clearLocalData);
 
+el("chart-info-btn").addEventListener("click", () => {
+  const popover = el("chart-info-popover");
+  const nowHidden = popover.classList.toggle("hidden");
+  el("chart-info-btn").classList.toggle("active", !nowHidden);
+  el("chart-info-btn").setAttribute("aria-expanded", String(!nowHidden));
+});
+
 restoreInputsFromCache();
 renderAllFromCache();
 

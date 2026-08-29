@@ -163,6 +163,33 @@ th { color: var(--text-muted); font-weight: 500; }
 }
 .checkbox-label input { cursor: pointer; }
 
+.info-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 999px;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  font-size: 0.85rem;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.info-btn:hover, .info-btn.active { color: var(--text); border-color: var(--accent); }
+
+.info-popover {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(79, 140, 255, 0.06);
+  padding: 0.75rem 0.9rem;
+  margin: 0.6rem 0;
+}
+.info-popover p { margin: 0; }
+.info-popover p + p { margin-top: 0.5rem; }
+
 .perf-badge {
   font-weight: 700;
   font-size: 0.95rem;
