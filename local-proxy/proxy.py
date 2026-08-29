@@ -127,20 +127,34 @@ def get_fx_series(start_d: date, end_d: date, from_ccy: str, to_ccy: str) -> dic
     key = (start_d.isoformat(), end_d.isoformat(), from_ccy, to_ccy)
     if key in FX_SERIES_CACHE:
         return FX_SERIES_CACHE[key]
-    try:
-        resp = requests.get(
-            f"https://api.frankfurter.app/{start_d.isoformat()}..{end_d.isoformat()}",
-            params={"from": from_ccy, "to": to_ccy},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        rates = resp.json().get("rates", {})
-        series = {d: v[to_ccy] for d, v in rates.items() if to_ccy in v}
-    except Exception:  # noqa: BLE001
-        logger.warning("FX-Abruf %s->%s fehlgeschlagen, verwende 1:1", from_ccy, to_ccy)
-        series = {}
-    FX_SERIES_CACHE[key] = series
-    return series
+    # Bis zu 3 Versuche: die kostenlose oeffentliche API antwortet gelegentlich
+    # mit einem einzelnen Timeout/Verbindungsfehler, der kurz danach schon
+    # wieder verschwunden ist (beobachtet waehrend Tests). Ohne Retry wuerde
+    # ein einzelner Aussetzer sofort auf den 1:1-Fallback zurueckfallen -
+    # das reicht z.B. bei der Waehrungserkennung (siehe login()) aus, um
+    # JEDEN Kandidaten faelschlich als unplausibel zu verwerfen.
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(0.5)
+        try:
+            resp = requests.get(
+                f"https://api.frankfurter.app/{start_d.isoformat()}..{end_d.isoformat()}",
+                params={"from": from_ccy, "to": to_ccy},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            rates = resp.json().get("rates", {})
+            series = {d: v[to_ccy] for d, v in rates.items() if to_ccy in v}
+            FX_SERIES_CACHE[key] = series
+            return series
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+    # Bewusst NICHT cachen: ein anhaltender Fehler soll beim naechsten Aufruf
+    # erneut versucht werden, statt fuer den Rest der laufenden Sitzung als
+    # "leere Serie" (1:1-Fallback) haengenzubleiben.
+    logger.warning("FX-Abruf %s->%s fehlgeschlagen nach 3 Versuchen (%s), verwende 1:1", from_ccy, to_ccy, last_error)
+    return {}
 
 
 def fx_rate_on(fx_series: dict[str, float], day: date, fallback: float = 1.0) -> float:
@@ -178,6 +192,36 @@ def detect_base_currency(client_details: dict) -> str:
     """
     data = (client_details or {}).get("data", {})
     return data.get("baseCurrency") or data.get("currency") or "EUR"
+
+
+def _verify_base_currency(candidate: str, positions: list[dict]) -> bool:
+    """
+    Prueft `candidate` gegen DEGIROs eigenes "value"-Feld je Position: dieses
+    sollte ungefaehr size * price * fx_rate(Positionswaehrung -> candidate)
+    ergeben (siehe detect_base_currency()). Toleranz +-5%, um leichten
+    Zeitversatz zwischen Positions- und Tageskurs zuzulassen. Verlangt
+    mindestens eine pruefbare Position (Fremdwaehrung ungleich candidate,
+    da sich Positionen in candidate selbst nicht von anderen Kandidaten
+    unterscheiden liessen) und dass ALLE pruefbaren Positionen passen -
+    ein einzelner Ausreisser genuegt, um den Kandidaten zu verwerfen.
+    """
+    checked = 0
+    for p in positions:
+        currency = p.get("currency")
+        size = _num(p.get("size"))
+        price = _num(p.get("price"))
+        raw_value = p.get("value")
+        if not currency or currency == candidate or size == 0 or price == 0 or raw_value is None:
+            continue
+        native_value = size * price
+        expected_rate = get_latest_fx_rate(currency, candidate)
+        if native_value == 0 or expected_rate == 0:
+            continue
+        implied_rate = _num(raw_value) / native_value
+        if abs(implied_rate - expected_rate) / expected_rate > 0.05:
+            return False
+        checked += 1
+    return checked > 0
 
 
 # --- Hilfsfunktionen: historische Kurse (DEGIRO vwd-Chart-API) --------------
@@ -575,18 +619,21 @@ def login():
         SESSION["trading_api"] = trading_api
         SESSION["int_account"] = int_account
         SESSION["user_token"] = user_token
-        base_currency = detect_base_currency(client_details)
-        # client_details liefert bei diesem Konto weder "currency" noch
+        # Provisorische Bestimmung der Konto-Basiswaehrung direkt beim Login.
+        # client_details liefert bei manchen Konten weder "currency" noch
         # "baseCurrency" (beide None) - detect_base_currency() faellt dann
-        # auf "EUR" zurueck, was aber nachweislich falsch ist: DEGIROs
-        # eigenes "value"-Feld je Position (siehe portfolio()) und die
-        # "...InBaseCurrency"-Felder der Transaktionen sind tatsaechlich
-        # bereits in der Waehrung angegeben, in der DEGIRO das Konto selbst
-        # fuehrt/anzeigt - verifizierbar direkt ueber die cashFunds-Waehrung
-        # (die "available to trade"-Anzeige ist nachweislich korrekt). Diese
-        # tatsaechliche Kontowaehrung hat Vorrang vor dem Rateversuch ueber
-        # client_details.
-        cash_currency = None
+        # auf "EUR" zurueck, was nicht zwingend stimmt. Als bessere Vermutung
+        # wird, falls vorhanden, die tatsaechlich genutzte CASH_FUNDS-Waehrung
+        # verwendet (_get_cash_available_to_trade waehlt dafuer bewusst den
+        # Betrag mit dem groessten CHF-Gegenwert unabhaengig vom Vorzeichen,
+        # siehe dort - ein Margin-Debit ist genauso aussagekraeftig wie ein
+        # Guthaben). Endgueltig VERIFIZIERT wird diese Vermutung erst in
+        # portfolio() gegen DEGIROs eigenes "value"-Feld der tatsaechlich
+        # gehaltenen Positionen (siehe _verify_base_currency) - direkt hier
+        # beim Login sind die Positions-/Kursdaten im frischen get_update()
+        # manchmal noch nicht vollstaendig synchronisiert, was die Pruefung
+        # faelschlich fuer jeden Kandidaten scheitern liess.
+        base_currency = detect_base_currency(client_details)
         try:
             cash_update = trading_api.get_update(
                 request_list=[UpdateRequest(option=UpdateOption.CASH_FUNDS, last_updated=0)],
@@ -597,13 +644,14 @@ def login():
                 base_currency = cash_currency
         except Exception:  # noqa: BLE001
             logger.warning("Konto-Waehrung ueber cashFunds nicht ermittelbar, verwende Fallback", exc_info=True)
+
         SESSION["base_currency"] = base_currency
         SESSION["logged_in_at"] = datetime.now().isoformat()
         logger.info(
-            "Konto-Waehrung: client_details.currency=%s client_details.baseCurrency=%s cashFunds=%s -> verwendet=%s",
+            "Konto-Waehrung (provisorisch): client_details.currency=%s client_details.baseCurrency=%s -> verwendet=%s "
+            "(wird beim ersten Portfolio-Abruf verifiziert)",
             client_details.get("data", {}).get("currency"),
             client_details.get("data", {}).get("baseCurrency"),
-            cash_currency,
             SESSION["base_currency"],
         )
         # Nur im RAM fuer die Dauer dieser Sitzung - nie auf Platte geschrieben.
@@ -668,18 +716,34 @@ def logout():
 def _get_cash_available_to_trade(account_update: dict) -> tuple[float, str]:
     """
     'Available to trade'-Guthaben aus dem CASH_FUNDS-Block (nicht aus den
-    mehrdeutigen totalPortfolio-Reportfeldern). Liefert (Betrag, Waehrung)
-    fuer die groesste Position; bei mehreren Waehrungen werden alle
-    zurueckgegeben (siehe cashFunds im Response).
+    mehrdeutigen totalPortfolio-Reportfeldern). DEGIRO listet dort IMMER eine
+    Zeile pro unterstuetzter Waehrung, auch fuer Waehrungen, die dieses Konto
+    nie genutzt hat (Betrag exakt 0) - nur die tatsaechlich genutzte(n)
+    Waehrung(en) haben einen von 0 verschiedenen Betrag, der bei vollem
+    Investitionsgrad/Margin-Debit auch NEGATIV sein kann (Konto schuldet
+    Geld). Ein reiner Groessenvergleich der (nach CHF umgerechneten)
+    signierten Betraege waere daher irrefuehrend: 0 > jeder negative Betrag,
+    wodurch eine bedeutungslose 0-Platzhalterzeile faelschlich den echten
+    (negativen) Saldo verdraengen wuerde - und darueber, weil dieselbe
+    Waehrung auch als Konto-Basiswaehrung uebernommen wird (siehe login()),
+    saemtliche CHF-Werte im Portfolio verzerrt. Deshalb wird nach dem
+    CHF-Gegenwert mit dem groessten BETRAG (unabhaengig vom Vorzeichen)
+    gewaehlt; zurueckgegeben wird weiterhin der native (ggf. negative)
+    Betrag in seiner Original-Waehrung.
     """
     raw_cash = (account_update.get("cashFunds") or {}).get("value") or []
     rows = _flatten_rows(raw_cash)
     best = None
+    best_chf = None
     for row in rows:
         amount = _num(row.get("value"))
         currency = row.get("currencyCode") or row.get("currency")
-        if currency and (best is None or amount > best[0]):
+        if not currency:
+            continue
+        amount_chf = amount * get_latest_fx_rate(currency, TARGET_CURRENCY)
+        if best is None or abs(amount_chf) > abs(best_chf):
             best = (amount, currency)
+            best_chf = amount_chf
     return best or (0.0, "EUR")
 
 
@@ -702,6 +766,22 @@ def portfolio():
         raw_positions = (account_update.get("portfolio") or {}).get("value") or []
         positions = _flatten_rows(raw_positions)
         positions = [p for p in positions if p.get("positionType") in (None, "PRODUCT") and _num(p.get("size")) != 0]
+
+        # Verifiziert/korrigiert die beim Login nur provisorisch bestimmte
+        # Basiswaehrung (siehe login()) gegen DEGIROs eigenes "value"-Feld
+        # der jetzt zuverlaessig geladenen Positionen: value_native sollte
+        # size * price * fx_rate(Positionswaehrung -> Basiswaehrung) ergeben
+        # (siehe _verify_base_currency). Findet sich kein besserer Kandidat
+        # als der aktuell gesetzte, bleibt dieser unveraendert - so wird eine
+        # bereits korrekte, per client_details gelieferte Basiswaehrung nicht
+        # grundlos durch einen zufaellig auch passenden Kandidaten ersetzt.
+        if not _verify_base_currency(base_currency, positions):
+            for candidate in ("CHF", "EUR", "USD", "GBP"):
+                if candidate != base_currency and _verify_base_currency(candidate, positions):
+                    logger.info("Basiswaehrung korrigiert: %s -> %s (gegen Positionswerte verifiziert)", base_currency, candidate)
+                    base_currency = candidate
+                    SESSION["base_currency"] = candidate
+                    break
 
         product_ids = [int(p["id"]) for p in positions if p.get("id") is not None]
         product_info = {}
