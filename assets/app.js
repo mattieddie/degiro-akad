@@ -191,6 +191,57 @@ function updatePerfBadge(pctSeries, badgeId = "chart-perf-badge") {
   badge.className = "perf-badge " + (last > 0 ? "perf-pos" : last < 0 ? "perf-neg" : "");
 }
 
+// Chart.js' eingebauter "nice number"-Algorithmus fuer die Y-Achse rundet die
+// Grenzen auf Vielfache einer Schrittweite, die aus dem GESAMTEN Datenbereich
+// ueber alle Datasets hinweg abgeleitet wird - kombiniert man eine Kurve im
+// Bereich von z.B. 43'000 mit einer nahe 0 (Cash-Linie), landet die Schrittweite
+// bei z.B. 10'000 und die Achse wird bis 0 bzw. weit darueber hinaus aufgerundet,
+// selbst wenn sich die eigentlichen Werte im gewaehlten Zeitraum kaum bewegen
+// (z.B. 1 Woche). Deshalb werden min/max hier explizit aus den tatsaechlich
+// sichtbaren Werten berechnet, mit etwas Rand oben/unten.
+function computeYRange(valueArrays, paddingRatio = 0.08) {
+  let min = Infinity;
+  let max = -Infinity;
+  for (const arr of valueArrays) {
+    for (const v of arr) {
+      if (v === null || v === undefined || Number.isNaN(v)) continue;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return undefined;
+  if (min === max) { min -= 1; max += 1; }
+  const pad = (max - min) * paddingRatio;
+  return { min: min - pad, max: max + pad };
+}
+
+// Formatiert ein "YYYY-MM-DD"-Datum fuer die X-Achse abhaengig vom gewaehlten
+// Zeitraum - je kuerzer der Zeitraum, desto feiner die Aufloesung (Tag/Monat),
+// je laenger, desto grober (Monat/Jahr), statt ueberall das volle ISO-Datum
+// anzuzeigen.
+function formatDateLabel(dateStr, range) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  if (range === "1D" || range === "1W" || range === "1M") {
+    return new Intl.DateTimeFormat("de-CH", { day: "2-digit", month: "2-digit", timeZone: "UTC" }).format(d);
+  }
+  if (range === "3M" || range === "6M") {
+    return new Intl.DateTimeFormat("de-CH", { day: "2-digit", month: "short", timeZone: "UTC" }).format(d);
+  }
+  return new Intl.DateTimeFormat("de-CH", { month: "short", year: "numeric", timeZone: "UTC" }).format(d);
+}
+
+function xAxisOptions() {
+  return {
+    ticks: {
+      maxTicksLimit: 8,
+      autoSkip: true,
+      callback: function (value) {
+        return formatDateLabel(this.getLabelForValue(value), currentRange);
+      },
+    },
+  };
+}
+
 function renderChart(fullSeries) {
   el("panel-chart").classList.remove("hidden");
   const series = filterByRange(fullSeries, currentRange);
@@ -204,6 +255,7 @@ function renderChart(fullSeries) {
   if (currentMode === "percent") {
     el("chart-title").textContent = "Performance seit Range-Start, einzahlungsbereinigt (%)";
     const pct = rebasedPct;
+    const yRange = computeYRange([pct]);
     historyChart = new Chart(ctx, {
       type: "line",
       data: {
@@ -214,24 +266,45 @@ function renderChart(fullSeries) {
       },
       options: {
         responsive: true,
+        maintainAspectRatio: false,
         plugins: { legend: { position: "bottom" } },
-        scales: { y: { ticks: { callback: (v) => v.toFixed(1) + "%" } } },
+        scales: {
+          x: xAxisOptions(),
+          y: { ...yRange, ticks: { callback: (v) => v.toFixed(1) + "%" } },
+        },
       },
     });
   } else {
     el("chart-title").textContent = "Performance über Zeit (CHF)";
     const equity = series.map((h) => h.equity);
     const cash = series.map((h) => h.cash);
+    // Cash liegt meist nahe 0 und Gesamtwert im Tausenderbereich - auf einer
+    // gemeinsamen Achse wuerde die Cash-Linie die Skala bis in die Naehe von 0
+    // ziehen, wodurch die eigentlich interessanten (oft kleinen) Schwankungen
+    // des Gesamtwerts kaum noch sichtbar waeren. Deshalb bekommt Cash eine
+    // eigene, unsichtbare Sekundaerachse ("y1") - jede Linie wird auf ihrer
+    // eigenen Skala eng an ihre tatsaechlichen Werte herangezoomt.
+    const yRange = computeYRange([equity]);
+    const yCashRange = computeYRange([cash]);
     historyChart = new Chart(ctx, {
       type: "line",
       data: {
         labels,
         datasets: [
-          { label: "Gesamtwert (CHF)", data: equity, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,0.15)", tension: 0.2, fill: true, pointRadius: series.length > 90 ? 0 : 2 },
-          { label: "Cash / Available to Trade (CHF)", data: cash, borderColor: "#35c98f", backgroundColor: "transparent", borderDash: [4, 3], tension: 0.2, pointRadius: 0 },
+          { label: "Gesamtwert (CHF)", data: equity, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,0.15)", tension: 0.2, fill: true, pointRadius: series.length > 90 ? 0 : 2, yAxisID: "y" },
+          { label: "Cash / Available to Trade (CHF)", data: cash, borderColor: "#35c98f", backgroundColor: "transparent", borderDash: [4, 3], tension: 0.2, pointRadius: 0, yAxisID: "y1" },
         ],
       },
-      options: { responsive: true, plugins: { legend: { position: "bottom" } }, scales: { y: { beginAtZero: false } } },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "bottom" } },
+        scales: {
+          x: xAxisOptions(),
+          y: { beginAtZero: false, ...yRange },
+          y1: { display: false, beginAtZero: false, ...yCashRange },
+        },
+      },
     });
   }
 }

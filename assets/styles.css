@@ -190,6 +190,18 @@ th { color: var(--text-muted); font-weight: 500; }
 .info-popover p { margin: 0; }
 .info-popover p + p { margin-top: 0.5rem; }
 
+.chart-canvas-wrap {
+  position: relative;
+  height: 420px;
+}
+.chart-canvas-wrap canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+@media (max-width: 640px) {
+  .chart-canvas-wrap { height: 280px; }
+}
+
 .perf-badge {
   font-weight: 700;
   font-size: 0.95rem;
