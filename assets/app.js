@@ -30,6 +30,7 @@ const LS_KEYS = {
   showClosed: "degiro_show_closed",
   fmpKey: "degiro_fmp_key",
   dividends: "degiro_dividends",
+  sectors: "degiro_sectors",
 };
 
 const RANGE_ORDER = ["1D", "1W", "1M", "3M", "6M", "1Y", "YTD", "MAX"];
@@ -45,6 +46,8 @@ let latestNetDeposits = null;
 let plTotalMode = "unrealized";
 let modalChart = null;
 let dividendsChart = null;
+let positionsPieChart = null;
+let sectorsPieChart = null;
 
 function loadLocal(key, fallback) {
   try {
@@ -521,9 +524,75 @@ function renderPositions(positions) {
     tr.addEventListener("click", () => openPositionModal(p));
     tbody.appendChild(tr);
   }
+
+  renderPositionsPie(positions);
 }
 
-const DIVIDEND_COLORS = [
+function pieTooltipLabel(ctx) {
+  const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+  const pct = total ? (ctx.parsed / total * 100).toFixed(1) : "0.0";
+  return `${ctx.label}: ${fmtChf(ctx.parsed)} (${pct}%)`;
+}
+
+function renderPositionsPie(positions) {
+  const canvas = el("chart-positions-pie");
+  if (!canvas) return;
+  const sorted = [...positions].filter((p) => (p.valueChf || 0) > 0).sort((a, b) => (b.valueChf || 0) - (a.valueChf || 0));
+  if (positionsPieChart) positionsPieChart.destroy();
+  positionsPieChart = new Chart(canvas.getContext("2d"), {
+    type: "doughnut",
+    data: {
+      labels: sorted.map((p) => p.symbol || p.name || p.productId),
+      datasets: [{
+        data: sorted.map((p) => p.valueChf || 0),
+        backgroundColor: sorted.map((_, i) => CHART_COLORS[i % CHART_COLORS.length]),
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: pieTooltipLabel } } },
+    },
+  });
+}
+
+// Sektor-Daten (/api/sectors) werden separat und lazy nachgeladen (siehe
+// refreshData) - dieses Chart wird deshalb erst gerendert, sobald sie da
+// sind bzw. aus dem Cache geladen wurden, nicht schon bei renderPositions.
+function renderSectorsPie(positions, sectorRows) {
+  const canvas = el("chart-sectors-pie");
+  if (!canvas || !sectorRows || !sectorRows.length) return;
+  const sectorByProduct = new Map(sectorRows.map((s) => [String(s.productId), s]));
+  const byLabel = new Map();
+  for (const p of positions) {
+    const info = sectorByProduct.get(String(p.productId));
+    let label = "Unbekannt";
+    if (info) {
+      if (info.sector) label = info.sector;
+      else if (info.quoteType === "ETF") label = "ETF";
+    }
+    byLabel.set(label, (byLabel.get(label) || 0) + (p.valueChf || 0));
+  }
+  const entries = [...byLabel.entries()].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+  if (sectorsPieChart) sectorsPieChart.destroy();
+  sectorsPieChart = new Chart(canvas.getContext("2d"), {
+    type: "doughnut",
+    data: {
+      labels: entries.map(([label]) => label),
+      datasets: [{
+        data: entries.map(([, v]) => v),
+        backgroundColor: entries.map((_, i) => CHART_COLORS[i % CHART_COLORS.length]),
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: pieTooltipLabel } } },
+    },
+  });
+}
+
+const CHART_COLORS = [
   "#4f8cff", "#35c98f", "#ffb020", "#ff5c6c", "#8b5cf6", "#14b8a6",
   "#f472b6", "#a3e635", "#fb923c", "#38bdf8", "#facc15", "#94a3b8",
 ];
@@ -578,7 +647,7 @@ function renderDividends(data) {
   const forecastByProduct = new Map(forecastPositions.map((p) => [p.productId, p.trailing12mChf]));
 
   const datasets = productIds.map((pid, i) => {
-    const color = DIVIDEND_COLORS[i % DIVIDEND_COLORS.length];
+    const color = CHART_COLORS[i % CHART_COLORS.length];
     const values = yearly.map((y) => {
       const entry = (y.byProduct || []).find((p) => p.productId === pid);
       return entry ? entry.amountChf : 0;
@@ -838,6 +907,8 @@ function renderAllFromCache() {
   if (portfolio) {
     renderSummary(portfolio.totals, portfolio.fetchedAt);
     renderPositions(portfolio.positions);
+    const sectorsData = loadLocal(LS_KEYS.sectors, null);
+    if (sectorsData) renderSectorsPie(portfolio.positions, sectorsData.positions);
   }
   if (transactions) renderTransactions(transactions.transactions);
   const closed = loadLocal(LS_KEYS.closedPositions, null);
@@ -946,6 +1017,17 @@ async function refreshData() {
     .catch(() => {
       // Kein hartes Fehlerfeedback noetig - Abschnitt bleibt einfach ausgeblendet
       // bzw. zeigt den zuletzt zwischengespeicherten Stand.
+    });
+
+  // Ebenfalls im Hintergrund: pro Position ein externer Yahoo-Finance-Abruf
+  // fuer den Wirtschaftssektor (DEGIRO liefert keinen).
+  proxyFetch("/api/sectors")
+    .then((sectorsData) => {
+      saveLocal(LS_KEYS.sectors, sectorsData);
+      renderSectorsPie(portfolio.positions, sectorsData.positions);
+    })
+    .catch(() => {
+      // Abschnitt bleibt einfach leer bzw. zeigt den zwischengespeicherten Stand.
     });
 }
 

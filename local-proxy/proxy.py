@@ -59,6 +59,7 @@ SESSION: dict = {
 # Nur fuer die Dauer des laufenden Prozesses im RAM - kein Zugriff auf Disk.
 FX_SERIES_CACHE: dict[tuple, dict[str, float]] = {}
 CHART_CACHE: dict[tuple, dict] = {}
+SECTOR_CACHE: dict[str, dict] = {}
 
 TARGET_CURRENCY = "CHF"
 
@@ -369,6 +370,79 @@ def yahoo_resolve_symbol(isin: str | None, fallback_symbol: str | None) -> str |
         except Exception:  # noqa: BLE001
             logger.warning("Yahoo-ISIN-Suche fuer %s fehlgeschlagen", isin, exc_info=True)
     return fallback_symbol
+
+
+# quoteSummary (Sektor/Branche) verlangt inzwischen, anders als Suche und
+# Kurschart oben, ein gueltiges Cookie + "Crumb"-Token (CSRF-aehnlicher Schutz,
+# den Yahoo seit einiger Zeit fuer diesen speziellen Endpunkt durchsetzt).
+# Wird einmal pro Prozess geholt und wiederverwendet; bei Ablauf/401 einmalig
+# neu geholt.
+_yahoo_session: requests.Session | None = None
+_yahoo_crumb: str | None = None
+
+
+def _get_yahoo_crumb(force_refresh: bool = False) -> tuple[requests.Session, str | None]:
+    global _yahoo_session, _yahoo_crumb
+    if _yahoo_session is None:
+        _yahoo_session = requests.Session()
+        _yahoo_session.headers.update(YAHOO_HEADERS)
+    if _yahoo_crumb is None or force_refresh:
+        try:
+            _yahoo_session.get("https://fc.yahoo.com", timeout=10)
+            resp = _yahoo_session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=10)
+            resp.raise_for_status()
+            _yahoo_crumb = resp.text.strip() or None
+        except Exception:  # noqa: BLE001
+            logger.warning("Yahoo-Crumb-Abruf fehlgeschlagen", exc_info=True)
+            _yahoo_crumb = None
+    return _yahoo_session, _yahoo_crumb
+
+
+def fetch_yahoo_sector(isin: str | None, fallback_symbol: str | None) -> dict:
+    """
+    Liefert {"sector": str|None, "industry": str|None, "quoteType": str|None}
+    fuer eine Position, per Prozess-Cache (SECTOR_CACHE) ueber die Ziel-
+    Waehrung/den Sitzungslauf hinweg wiederverwendet. Reine Aktien haben i.d.R.
+    einen echten GICS-Sektor (z.B. "Real Estate"); ETFs/ETPs haben KEINEN
+    Sektor im eigentlichen Sinn (Yahoo liefert dafuer ein leeres assetProfile),
+    werden aber ueber "quoteType" als "ETF" erkennbar. Zertifikate/Hebel-
+    produkte sind in Yahoo meist gar nicht auffindbar - dann bleibt alles None
+    und das Frontend gruppiert sie unter "Unbekannt".
+    """
+    symbol = yahoo_resolve_symbol(isin, fallback_symbol)
+    if not symbol:
+        return {"sector": None, "industry": None, "quoteType": None}
+    if symbol in SECTOR_CACHE:
+        return SECTOR_CACHE[symbol]
+
+    result = {"sector": None, "industry": None, "quoteType": None}
+    for attempt in range(2):
+        session, crumb = _get_yahoo_crumb(force_refresh=(attempt == 1))
+        try:
+            resp = session.get(
+                f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}",
+                params={"modules": "assetProfile,quoteType", **({"crumb": crumb} if crumb else {})},
+                timeout=15,
+            )
+            if resp.status_code == 401 and attempt == 0:
+                continue  # Crumb evtl. abgelaufen - einmal mit frischem Crumb erneut versuchen.
+            resp.raise_for_status()
+            entries = ((resp.json() or {}).get("quoteSummary") or {}).get("result") or []
+            if entries:
+                profile = entries[0].get("assetProfile") or {}
+                quote_type = entries[0].get("quoteType") or {}
+                result = {
+                    "sector": profile.get("sector"),
+                    "industry": profile.get("industry"),
+                    "quoteType": quote_type.get("quoteType"),
+                }
+            break
+        except Exception:  # noqa: BLE001
+            logger.warning("Yahoo-Sektor fuer Symbol=%s nicht abrufbar", symbol, exc_info=True)
+            break
+
+    SECTOR_CACHE[symbol] = result
+    return result
 
 
 def fetch_yahoo_daily_close_series(isin: str | None, fallback_symbol: str | None, since_d: date) -> tuple[dict[str, float], str | None]:
@@ -1563,6 +1637,45 @@ def dividends():
         "forecastPeriodStart": forecast_start.isoformat(),
         "forecastPeriodEnd": date.today().isoformat(),
     })
+
+
+@app.route("/api/sectors", methods=["GET"])
+@require_auth
+@require_login
+def sectors():
+    """
+    Wirtschaftssektor je aktuell gehaltener Position, ueber Yahoo Finance
+    (siehe fetch_yahoo_sector) - DEGIROs eigene Produktdaten enthalten keine
+    Sektor-/Brancheninformation. Reine Best-Effort-Zuordnung: ETFs/ETPs haben
+    keinen echten Sektor (werden als "ETF" gekennzeichnet), nicht ueber Yahoo
+    auffindbare Produkte (v.a. Zertifikate/Hebelprodukte) liefern ueberall
+    null - das Frontend gruppiert das unter "Unbekannt".
+    """
+    trading_api = SESSION["trading_api"]
+    try:
+        account_update = trading_api.get_update(
+            request_list=[UpdateRequest(option=UpdateOption.PORTFOLIO, last_updated=0)],
+            raw=True,
+        )
+        positions = _flatten_rows((account_update.get("portfolio") or {}).get("value") or [])
+        positions = [p for p in positions if p.get("positionType") in (None, "PRODUCT") and _num(p.get("size")) != 0]
+        product_ids = [int(p["id"]) for p in positions if p.get("id") is not None]
+        product_info = {}
+        if product_ids:
+            info_raw = trading_api.get_products_info(product_list=product_ids, raw=True)
+            product_info = (info_raw or {}).get("data", {})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Positionen fuer Sektor-Zuordnung nicht abrufbar")
+        return jsonify({"error": f"Positionen nicht abrufbar: {e}"}), 502
+
+    results = []
+    for p in positions:
+        pid = str(p.get("id"))
+        info = product_info.get(pid, {})
+        sector_info = fetch_yahoo_sector(info.get("isin"), info.get("symbol"))
+        results.append({"productId": pid, **sector_info})
+
+    return jsonify({"positions": results})
 
 
 def main():
