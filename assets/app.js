@@ -29,6 +29,7 @@ const LS_KEYS = {
   closedPositions: "degiro_closed_positions",
   showClosed: "degiro_show_closed",
   fmpKey: "degiro_fmp_key",
+  dividends: "degiro_dividends",
 };
 
 const RANGE_ORDER = ["1D", "1W", "1M", "3M", "6M", "1Y", "YTD", "MAX"];
@@ -43,6 +44,7 @@ let lastTotals = null;
 let latestNetDeposits = null;
 let plTotalMode = "unrealized";
 let modalChart = null;
+let dividendsChart = null;
 
 function loadLocal(key, fallback) {
   try {
@@ -521,6 +523,100 @@ function renderPositions(positions) {
   }
 }
 
+const DIVIDEND_COLORS = [
+  "#4f8cff", "#35c98f", "#ffb020", "#ff5c6c", "#8b5cf6", "#14b8a6",
+  "#f472b6", "#a3e635", "#fb923c", "#38bdf8", "#facc15", "#94a3b8",
+];
+
+function hexToRgba(hex, alpha) {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.substring(0, 2), 16);
+  const g = parseInt(h.substring(2, 4), 16);
+  const b = parseInt(h.substring(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function renderDividends(data) {
+  const yearly = data.yearly || [];
+  const forecastPositions = data.forecastPositions || [];
+  if (!yearly.length) {
+    el("panel-dividends").classList.add("hidden");
+    return;
+  }
+  el("panel-dividends").classList.remove("hidden");
+
+  const badge = el("dividend-forecast-badge");
+  if (data.forecastChf) {
+    badge.textContent = `Prognose 12M: ${fmtChf(data.forecastChf)}`;
+    badge.className = "perf-badge perf-pos";
+  } else {
+    badge.textContent = "";
+    badge.className = "perf-badge";
+  }
+
+  // Jede Saeule (Jahr) wird nach ausschuettender Position unterteilt und
+  // eingefaerbt; die "Prognose"-Saeule nutzt dieselben Farben, aber mit
+  // reduzierter Deckkraft, um sie optisch von echten Ist-Werten abzuheben.
+  // Farbzuordnung/Stapel-Reihenfolge nach Gesamtbeitrag ueber alle Jahre
+  // absteigend, damit die groessten Dividendenzahler immer dieselbe Farbe
+  // behalten und zuunterst im Stack liegen.
+  const totalsByProduct = new Map();
+  const labelsByProduct = new Map();
+  for (const y of yearly) {
+    for (const p of y.byProduct || []) {
+      totalsByProduct.set(p.productId, (totalsByProduct.get(p.productId) || 0) + p.amountChf);
+      labelsByProduct.set(p.productId, p.symbol || p.name || String(p.productId));
+    }
+  }
+  for (const p of forecastPositions) {
+    if (!labelsByProduct.has(p.productId)) labelsByProduct.set(p.productId, p.symbol || p.name || String(p.productId));
+  }
+  const productIds = [...labelsByProduct.keys()].sort((a, b) => (totalsByProduct.get(b) || 0) - (totalsByProduct.get(a) || 0));
+
+  const labels = [...yearly.map((y) => String(y.year)), "Prognose"];
+  const forecastIdx = labels.length - 1;
+  const forecastByProduct = new Map(forecastPositions.map((p) => [p.productId, p.trailing12mChf]));
+
+  const datasets = productIds.map((pid, i) => {
+    const color = DIVIDEND_COLORS[i % DIVIDEND_COLORS.length];
+    const values = yearly.map((y) => {
+      const entry = (y.byProduct || []).find((p) => p.productId === pid);
+      return entry ? entry.amountChf : 0;
+    });
+    values.push(forecastByProduct.get(pid) || 0);
+    return {
+      label: labelsByProduct.get(pid),
+      data: values,
+      backgroundColor: values.map((_, idx) => (idx === forecastIdx ? hexToRgba(color, 0.35) : color)),
+    };
+  });
+
+  const ctx = el("chart-dividends").getContext("2d");
+  if (dividendsChart) dividendsChart.destroy();
+  dividendsChart = new Chart(ctx, {
+    type: "bar",
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } },
+    },
+  });
+
+  const tbody = document.querySelector("#table-dividend-forecast tbody");
+  tbody.innerHTML = "";
+  for (const p of forecastPositions) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${p.name ?? p.productId}</td>
+      <td>${p.symbol ?? "–"}</td>
+      <td>${fmtChf(p.trailing12mChf)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
 function renderTransactions(transactions) {
   el("panel-transactions").classList.remove("hidden");
   const tbody = document.querySelector("#table-transactions tbody");
@@ -746,6 +842,8 @@ function renderAllFromCache() {
   if (transactions) renderTransactions(transactions.transactions);
   const closed = loadLocal(LS_KEYS.closedPositions, null);
   if (closed) renderClosedPositions(closed.positions);
+  const dividendsData = loadLocal(LS_KEYS.dividends, null);
+  if (dividendsData) renderDividends(dividendsData);
 
   const merged = mergeHistorySeries(backfill.series, organic);
   if (merged.length) {
@@ -837,6 +935,17 @@ async function refreshData() {
     })
     .catch((err) => {
       el("history-note").textContent = "Seit-Kauf-Rekonstruktion fehlgeschlagen, zeige nur lokal erfasste Tage: " + err.message;
+    });
+
+  // Ebenfalls rechenintensiv (volle Kontohistorie durchsuchen) - im Hintergrund.
+  proxyFetch("/api/dividends")
+    .then((dividendsData) => {
+      saveLocal(LS_KEYS.dividends, dividendsData);
+      renderDividends(dividendsData);
+    })
+    .catch(() => {
+      // Kein hartes Fehlerfeedback noetig - Abschnitt bleibt einfach ausgeblendet
+      // bzw. zeigt den zuletzt zwischengespeicherten Stand.
     });
 }
 

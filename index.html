@@ -169,6 +169,33 @@
     </div>
   </section>
 
+  <section id="panel-dividends" class="card hidden">
+    <div class="chart-header">
+      <h2>Dividenden</h2>
+      <span id="dividend-forecast-badge" class="perf-badge"></span>
+    </div>
+    <p class="hint">
+      Erhaltene Dividenden pro Jahr (netto, nach Quellensteuer). Prognose = Summe der in
+      den letzten 12 Monaten tatsächlich erhaltenen Dividenden je aktuell gehaltener
+      Position (keine Hochrechnung, keine externe Dividendenkalender-Quelle).
+    </p>
+    <div class="chart-canvas-wrap dividends-chart-wrap">
+      <canvas id="chart-dividends"></canvas>
+    </div>
+    <div class="table-wrap">
+      <table id="table-dividend-forecast">
+        <thead>
+          <tr>
+            <th>Position</th>
+            <th>Symbol</th>
+            <th>Letzte 12 Monate (CHF)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
   <section id="panel-transactions" class="card hidden">
     <h2>Letzte Transaktionen</h2>
     <div class="table-wrap">

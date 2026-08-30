@@ -1441,6 +1441,130 @@ def closed_positions():
         return jsonify({"error": f"Fehler beim Abrufen der geschlossenen Positionen: {e}"}), 502
 
 
+@app.route("/api/dividends", methods=["GET"])
+@require_auth
+@require_login
+def dividends():
+    """
+    Erhaltene Dividenden pro Jahr (netto, nach Quellensteuer) plus eine
+    einfache Prognose fuer die naechsten 12 Monate: je aktuell gehaltener
+    Position die Summe der in den letzten 12 Monaten TATSAECHLICH fuer genau
+    diese Position erhaltenen Dividenden (kein hochgerechneter Pro-Aktie-Wert,
+    keine externe Dividendenkalender-Quelle - nur echte, bereits verbuchte
+    Zahlungen). Das ist eine grobe Naeherung: unterschaetzt die Prognose bei
+    kuerzlich aufgestockten Positionen (noch keine 12 Monate Historie in
+    dieser Groesse) und ueberschaetzt sie bei kuerzlich reduzierten.
+
+    Dividenden werden wie bei der Netto-Einzahlungs-Berechnung (siehe
+    build_cash_and_net_deposits_history) ueber das 'description'-Feld der
+    Kontobuchungen erkannt ("Dividende"/"Dividendensteuer") - DEGIROs 'type'
+    unterscheidet sie nicht von anderen Cash-Buchungen.
+    """
+    trading_api = SESSION["trading_api"]
+    try:
+        overview = trading_api.get_account_overview(
+            overview_request=OverviewRequest(from_date=date(2005, 1, 1), to_date=date.today()),
+            raw=False,
+        )
+        movements = (overview.cash_movements if overview else None) or []
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Kontoauszug (cashMovements) nicht abrufbar")
+        return jsonify({"error": f"Kontoauszug nicht abrufbar: {e}"}), 502
+
+    dividend_movements = [
+        m for m in movements
+        if m.date is not None and m.change is not None
+        and m.description and "divid" in m.description.lower()
+    ]
+    if not dividend_movements:
+        return jsonify({"yearly": [], "forecastChf": 0.0, "forecastPositions": [],
+                         "forecastPeriodStart": None, "forecastPeriodEnd": None})
+
+    since_d = min(m.date.date() for m in dividend_movements)
+    fx_cache: dict[str, dict[str, float]] = {}
+
+    def _to_chf(ccy, amount, day: date) -> float:
+        if not isinstance(ccy, str) or len(ccy) != 3 or not ccy.isalpha():
+            return 0.0
+        ccy = ccy.upper()
+        if ccy not in fx_cache:
+            fx_cache[ccy] = get_fx_series(since_d, date.today(), ccy, TARGET_CURRENCY)
+        return _num(amount) * fx_rate_on(fx_cache[ccy], day, fallback=1.0)
+
+    # Pro Jahr UND pro Position aufgeschluesselt (nicht nur die Jahressumme),
+    # damit das Frontend die Saeulen nach ausschuettender Position einfaerben
+    # kann. Bewegungen ohne erkennbare productId (in der Praxis bislang keine
+    # beobachtet) fliessen nicht in die Aufschluesselung ein, wohl aber in
+    # "totalChf" - beide sollten also normalerweise uebereinstimmen.
+    yearly_total: dict[int, float] = {}
+    yearly_by_product: dict[int, dict[int, float]] = {}
+    forecast_by_product: dict[int, float] = {}
+    forecast_start = date.today() - timedelta(days=365)
+    all_product_ids: set[int] = set()
+    for m in dividend_movements:
+        day = m.date.date()
+        amount_chf = _to_chf(m.currency, m.change, day)
+        yearly_total[day.year] = yearly_total.get(day.year, 0.0) + amount_chf
+        if m.product_id is not None:
+            all_product_ids.add(m.product_id)
+            by_product = yearly_by_product.setdefault(day.year, {})
+            by_product[m.product_id] = by_product.get(m.product_id, 0.0) + amount_chf
+            if day >= forecast_start:
+                forecast_by_product[m.product_id] = forecast_by_product.get(m.product_id, 0.0) + amount_chf
+
+    held_ids: set[int] = set()
+    try:
+        account_update = trading_api.get_update(
+            request_list=[UpdateRequest(option=UpdateOption.PORTFOLIO, last_updated=0)],
+            raw=True,
+        )
+        current_positions = _flatten_rows((account_update.get("portfolio") or {}).get("value") or [])
+        held_ids = {int(p["id"]) for p in current_positions
+                    if p.get("id") is not None and p.get("positionType") in (None, "PRODUCT")
+                    and _num(p.get("size")) != 0}
+    except Exception:  # noqa: BLE001
+        logger.warning("Aktuelle Positionen fuer Dividenden-Prognose nicht ermittelbar", exc_info=True)
+
+    # Ein Produkt-Info-Abruf fuer ALLE jemals dividendenzahlenden Produkte -
+    # deckt sowohl die historischen Saeulen (auch laengst verkaufte Positionen)
+    # als auch die Prognose (nur noch gehaltene) mit Name/Symbol ab.
+    product_info: dict = {}
+    if all_product_ids:
+        info_raw = trading_api.get_products_info(product_list=list(all_product_ids), raw=True)
+        product_info = (info_raw or {}).get("data", {})
+
+    def _position_label(pid: int) -> dict:
+        info = product_info.get(str(pid), {})
+        return {"productId": pid, "name": info.get("name"), "symbol": info.get("symbol")}
+
+    yearly_list = []
+    for y in sorted(yearly_total):
+        by_product = yearly_by_product.get(y, {})
+        yearly_list.append({
+            "year": y,
+            "totalChf": round(yearly_total[y], 2),
+            "byProduct": [
+                {**_position_label(pid), "amountChf": round(amt, 2)}
+                for pid, amt in sorted(by_product.items(), key=lambda kv: -kv[1])
+            ],
+        })
+
+    forecast_positions = []
+    forecast_total = 0.0
+    for pid in sorted((p for p in forecast_by_product if p in held_ids), key=lambda p: -forecast_by_product[p]):
+        amount_chf = forecast_by_product[pid]
+        forecast_total += amount_chf
+        forecast_positions.append({**_position_label(pid), "trailing12mChf": round(amount_chf, 2)})
+
+    return jsonify({
+        "yearly": yearly_list,
+        "forecastChf": round(forecast_total, 2),
+        "forecastPositions": forecast_positions,
+        "forecastPeriodStart": forecast_start.isoformat(),
+        "forecastPeriodEnd": date.today().isoformat(),
+    })
+
+
 def main():
     parser = argparse.ArgumentParser(description="Lokaler DEGIRO-Proxy fuer das degiro-akad Dashboard")
     parser.add_argument("--port", type=int, default=8765)
